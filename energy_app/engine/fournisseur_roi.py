@@ -487,10 +487,11 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
                            revision_prix_pct=0.0,
                            periode_revision_annees=5,
                            parallel_years=False,
-                           rapport_txt_path="fournisseur_rapport_complet.txt",
+                           rapport_txt_path=None,
                            progress_callback=None,
                            param_overrides=None,
-                           data_source=None):
+                           data_source=None,
+                           output_csv_path=None):
     """
     param_overrides : dict optionnel de parametres (memes cles que celles lues
     depuis l'Excel, cf. dataextraction._read_parameters) qui ecrasent, EN
@@ -506,7 +507,21 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
     data_source : optionnel, tuple (params, df) deja construit -- voir
     run_fournisseur_model_from_data ci-dessous, qui est le point d'entree
     recommande pour le nouveau flux sans Excel (CSV conso + PVGIS).
+
+    rapport_txt_path : optionnel, chemin ou dupliquer la sortie console
+    (log complet). None (par defaut) = pas de fichier ecrit, juste la
+    sortie console normale.
+
+    output_csv_path : optionnel, voir _run_fournisseur_model_impl -- None
+    (par defaut) = pas de CSV ecrit sur disque.
     """
+    if rapport_txt_path is None:
+        return _run_fournisseur_model_impl(
+            xlsm_path, dayahead_pkl_path, horizon_annees, discount_rate,
+            annee_remplacement_batterie, cout_remplacement_batterie_eur,
+            revision_prix_pct, periode_revision_annees, parallel_years,
+            progress_callback, param_overrides, data_source, output_csv_path)
+
     stdout_original = sys.stdout
     log_file = open(rapport_txt_path, "w", encoding="utf-8")
     sys.stdout = _Tee(stdout_original, log_file)
@@ -515,7 +530,7 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
             xlsm_path, dayahead_pkl_path, horizon_annees, discount_rate,
             annee_remplacement_batterie, cout_remplacement_batterie_eur,
             revision_prix_pct, periode_revision_annees, parallel_years,
-            progress_callback, param_overrides, data_source)
+            progress_callback, param_overrides, data_source, output_csv_path)
     finally:
         sys.stdout = stdout_original
         log_file.close()
@@ -529,8 +544,9 @@ def run_fournisseur_model_from_data(params: dict, df, dayahead_pkl_path=None,
                                      cout_remplacement_batterie_eur=25000,
                                      revision_prix_pct=0.0,
                                      periode_revision_annees=5,
-                                     rapport_txt_path="fournisseur_rapport_complet.txt",
-                                     progress_callback=None):
+                                     rapport_txt_path=None,
+                                     progress_callback=None,
+                                     output_csv_path=None):
     """
     Point d'entree pour le nouveau flux SANS Excel : params est le dict
     complet de parametres (tarifs, batterie, CAPEX...) saisi directement dans
@@ -550,6 +566,7 @@ def run_fournisseur_model_from_data(params: dict, df, dayahead_pkl_path=None,
         progress_callback=progress_callback,
         param_overrides=None,
         data_source=(params, df),
+        output_csv_path=output_csv_path,
     )
 
 
@@ -650,13 +667,18 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
                                  annee_remplacement_batterie, cout_remplacement_batterie_eur,
                                  revision_prix_pct, periode_revision_annees, parallel_years,
                                  progress_callback=None, param_overrides=None,
-                                 data_source=None):
+                                 data_source=None, output_csv_path=None):
     """
     data_source : optionnel, tuple (params: dict, df: pd.DataFrame) deja
     construit (typiquement via dataextraction.build_timeseries_from_sources,
     dans le nouveau flux sans Excel). Si fourni, xlsm_path est ignore et on
     saute completement la lecture Excel. param_overrides s'applique quand
     meme par-dessus, pour rester coherent avec l'ancien comportement.
+
+    output_csv_path : optionnel, chemin ou sauvegarder le detail annuel en
+    CSV (debug/inspection manuelle). None (par defaut) = pas d'ecriture --
+    l'appelant recupere de toute facon le DataFrame complet dans le dict
+    retourne (cle "detail_annuel").
     """
     if data_source is not None:
         print("Utilisation des donnees fournies directement (pas de lecture Excel).")
@@ -926,7 +948,8 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
         # independamment du fait que le tarif soit fixe ou HP/HC.
         serie_qh_annee1["price_reference_eur_kwh"] = price_import_year1[:n_pts]
 
-    result.to_csv("fournisseur_roi_resultats.csv", index=False)
+    if output_csv_path:
+        result.to_csv(output_csv_path, index=False)
 
     return {
         "params": params,
