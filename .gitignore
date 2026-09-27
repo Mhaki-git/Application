@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit / app runtime
+streamlit.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Excel lock files
+~$*.xls*
