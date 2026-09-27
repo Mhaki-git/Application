@@ -15,6 +15,9 @@ NB_ANNEES = 25, comme les colonnes B:Z de l'onglet source.
 import numpy as np
 import pandas as pd
 
+from finance_utils import pmt as _pmt, amortization_schedule as _amortization_schedule, irr_from_cashflows
+from pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct
+
 NB_ANNEES = 25
 
 DEFAULT_PARAMS = {
@@ -40,34 +43,6 @@ DEFAULT_PARAMS = {
     "nettoyage_eur_kwc": 0.0,              # Y8
     "indexation_maintenance_pct": 0.0,     # Y9
 }
-
-
-def _pmt(rate: float, nper: int, pv: float) -> float:
-    """Equivalent de -PMT(rate, nper, pv) d'Excel (mensualite/annuite constante)."""
-    if nper <= 0:
-        return 0.0
-    if rate == 0:
-        return pv / nper
-    return pv * rate / (1 - (1 + rate) ** (-nper))
-
-
-def _amortization_schedule(rate: float, nper: int, pv: float):
-    """
-    Reproduit IPMT/PMT periode par periode via un calcul d'amortissement
-    classique (solde restant du qui decroit) -- donne les memes valeurs que
-    les fonctions financieres Excel pour un pret a annuite constante.
-    Retourne (annuite, [interets_periode_1..nper], [capital_periode_1..nper]).
-    """
-    annuite = _pmt(rate, nper, pv)
-    solde = pv
-    interets, capital = [], []
-    for _ in range(nper):
-        interet = solde * rate
-        princ = annuite - interet
-        solde -= princ
-        interets.append(interet)
-        capital.append(princ)
-    return annuite, interets, capital
 
 
 def compute_fiche(params: dict) -> dict:
@@ -227,14 +202,7 @@ def compute_fiche(params: dict) -> dict:
     # sur investissement" a proprement parler puisque le CAPEX est finance).
     rendement_brut_pct = 100 / payback if payback else None  # #DIV/0! si payback = 0
 
-    irr = float("nan")
-    try:
-        from scipy.optimize import brentq
-        f = lambda r: sum(cf / (1 + r) ** t for t, cf in enumerate(resultat_annuel, start=1))
-        if f(-0.99) * f(10.0) < 0:
-            irr = brentq(f, -0.99, 10.0)
-    except Exception:
-        pass
+    irr = irr_from_cashflows(resultat_annuel, start_period=1)
 
     return {
         "params": p,
@@ -249,20 +217,6 @@ def compute_fiche(params: dict) -> dict:
         "payback_annees": payback, "rendement_brut_pct": rendement_brut_pct, "irr_pct": irr * 100 if irr == irr else None,
         "detail_annuel": df,
     }
-
-
-def _fmt_eur(x):
-    try:
-        return f"{x:,.0f}".replace(",", " ")
-    except Exception:
-        return "N/A"
-
-
-def _fmt_pct(x):
-    try:
-        return f"{x:.1f} %"
-    except Exception:
-        return "N/A"
 
 
 def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_name: str = "") -> str:
@@ -281,10 +235,6 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
         Paragraph, Spacer, Table, TableStyle
     )
     from reportlab.lib.enums import TA_CENTER
-
-    NAVY = colors.HexColor("#1B2A4A")
-    ACCENT = colors.HexColor("#F5A623")
-    LIGHTGREY = colors.HexColor("#F2F2F2")
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], textColor=NAVY, fontSize=20)

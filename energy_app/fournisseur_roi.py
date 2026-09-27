@@ -8,6 +8,7 @@ from scipy import sparse
 from scipy.optimize import linprog
 
 from dataextraction import extract_all, XLSM_PATH as DEFAULT_XLSM_PATH
+from finance_utils import compute_npv_irr
 
 import sys
 
@@ -476,19 +477,6 @@ def prix_vente_annee(prix_base: float, year: int, revision_pct: float = 0.0,
         return prix_base
     n_revisions = (year - 1) // periode_revision_annees
     return prix_base * (1 + revision_pct) ** n_revisions
-
-
-def compute_npv_irr(cashflows: list, discount_rate: float = DISCOUNT_RATE_DEFAULT):
-    npv = sum(cf / (1 + discount_rate) ** t for t, cf in enumerate(cashflows))
-    irr = float("nan")
-    try:
-        from scipy.optimize import brentq
-        f = lambda r: sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))
-        if f(-0.99) * f(10.0) < 0:
-            irr = brentq(f, -0.99, 10.0)
-    except Exception:
-        pass
-    return npv, irr
 
 
 def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PATH,

@@ -18,23 +18,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER
 
-NAVY = colors.HexColor("#1B2A4A")
-ACCENT = colors.HexColor("#F5A623")
-LIGHTGREY = colors.HexColor("#F2F2F2")
-
-
-def _fmt_eur(x):
-    try:
-        return f"{x:,.0f} EUR".replace(",", " ")
-    except Exception:
-        return "N/A"
-
-
-def _fmt_pct(x):
-    try:
-        return f"{x:.1f} %"
-    except Exception:
-        return "N/A"
+from pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_eur as _fmt_eur, fmt_pct as _fmt_pct
 
 
 def _chart_cashflow(result_df, capex_total):
