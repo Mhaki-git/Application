@@ -79,3 +79,15 @@ archive -- il s'ouvre normalement dans Excel qui recalcule tout tout seul).
 - `reporting/` -- generation des rapports PDF
   - `pdf_report.py` -- rapport PDF principal (modele fournisseur)
   - `pdf_style.py` -- formatage et style ReportLab partages
+- `tests/` -- tests de non-regression (voir section "Tests" ci-dessous)
+
+## Tests
+
+Suite de tests de non-regression sur les moteurs de calcul (`engine/`) --
+utile avant tout refactor pour verifier qu'aucun resultat ne change
+silencieusement.
+
+```
+pip install -r requirements-dev.txt
+python -m pytest
+```

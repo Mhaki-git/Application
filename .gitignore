@@ -25,3 +25,6 @@ Thumbs.db
 # Generated output artifacts
 energy_app/fournisseur_roi_resultats.csv
 energy_app/fournisseur_rapport_complet.txt
+
+# Test cache
+.pytest_cache/
