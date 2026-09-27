@@ -2,6 +2,9 @@
 MODELE ECONOMIQUE "FOURNISSEUR" : economies client + rentabilite (ROI).
 (voir docstring complet dans le script d'origine fourni par l'utilisateur)
 """
+from dataclasses import dataclass
+from typing import Callable, Optional
+
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -570,12 +573,60 @@ def run_fournisseur_model_from_data(params: dict, df, dayahead_pkl_path=None,
     )
 
 
-def _dispatch_one_year(args):
-    (year, conso_all, pv_all_year1, market_price_values, params, index,
-     p_max, contrat_kw, e_max_year1, degr_pv, degr_batt, inflation,
-     annee_remplacement_batterie, cout_remplacement_batterie_eur,
-     revenue_client_year1, old_cost_year1, revision_prix_pct, periode_revision_annees,
-     use_belpex, price_import_year1, price_export_year1, dispatch_fn) = args
+@dataclass(frozen=True)
+class YearDispatchContext:
+    """
+    Donnees/parametres COMMUNS a toutes les annees de l'horizon de simulation
+    (contrairement a `year`, qui varie a chaque appel de _dispatch_one_year).
+    Remplace l'ancien tuple positionnel a 20 elements ("common_args") --
+    un reordonnancement des champs ne peut plus casser silencieusement le
+    calcul, et chaque champ est nomme explicitement aux deux bouts.
+    """
+    conso_all: np.ndarray
+    pv_all_year1: np.ndarray
+    market_price_values: np.ndarray
+    params: dict
+    index: pd.DatetimeIndex
+    p_max: float
+    contrat_kw: float
+    e_max_year1: float
+    degr_pv: float
+    degr_batt: float
+    inflation: float
+    annee_remplacement_batterie: Optional[int]
+    cout_remplacement_batterie_eur: Optional[float]
+    revenue_client_year1: float
+    old_cost_year1: float
+    revision_prix_pct: float
+    periode_revision_annees: int
+    use_belpex: bool
+    price_import_year1: np.ndarray
+    price_export_year1: np.ndarray
+    dispatch_fn: Callable
+
+
+def _dispatch_one_year(year: int, ctx: YearDispatchContext):
+    conso_all = ctx.conso_all
+    pv_all_year1 = ctx.pv_all_year1
+    market_price_values = ctx.market_price_values
+    params = ctx.params
+    index = ctx.index
+    p_max = ctx.p_max
+    contrat_kw = ctx.contrat_kw
+    e_max_year1 = ctx.e_max_year1
+    degr_pv = ctx.degr_pv
+    degr_batt = ctx.degr_batt
+    inflation = ctx.inflation
+    annee_remplacement_batterie = ctx.annee_remplacement_batterie
+    cout_remplacement_batterie_eur = ctx.cout_remplacement_batterie_eur
+    revenue_client_year1 = ctx.revenue_client_year1
+    old_cost_year1 = ctx.old_cost_year1
+    revision_prix_pct = ctx.revision_prix_pct
+    periode_revision_annees = ctx.periode_revision_annees
+    use_belpex = ctx.use_belpex
+    price_import_year1 = ctx.price_import_year1
+    price_export_year1 = ctx.price_export_year1
+    dispatch_fn = ctx.dispatch_fn
 
     pv_year = pv_all_year1 * ((1 - degr_pv) ** (year - 1))
 
@@ -831,16 +882,20 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
 
     print(f"\nSimulation du dispatch Day-Ahead sur {horizon_annees} annees...")
 
-    common_args = (conso_all, pv_all_year1, market_price_values, params, index,
-                   p_max, contrat_kw, e_max_year1, degr_pv, degr_batt, inflation,
-                   annee_remplacement_batterie, cout_remplacement_batterie_eur,
-                   revenue_client_year1, old_cost_year1, revision_prix_pct, periode_revision_annees,
-                   use_belpex, price_import_year1, price_export_year1, dispatch_fn)
-    tasks = [(year,) + common_args for year in range(1, horizon_annees + 1)]
+    year_ctx = YearDispatchContext(
+        conso_all=conso_all, pv_all_year1=pv_all_year1, market_price_values=market_price_values,
+        params=params, index=index, p_max=p_max, contrat_kw=contrat_kw, e_max_year1=e_max_year1,
+        degr_pv=degr_pv, degr_batt=degr_batt, inflation=inflation,
+        annee_remplacement_batterie=annee_remplacement_batterie,
+        cout_remplacement_batterie_eur=cout_remplacement_batterie_eur,
+        revenue_client_year1=revenue_client_year1, old_cost_year1=old_cost_year1,
+        revision_prix_pct=revision_prix_pct, periode_revision_annees=periode_revision_annees,
+        use_belpex=use_belpex, price_import_year1=price_import_year1,
+        price_export_year1=price_export_year1, dispatch_fn=dispatch_fn,
+    )
 
     rows = []
-    for i, task in enumerate(tasks):
-        year = task[0]
+    for year in range(1, horizon_annees + 1):
         if year == 1 and annee_remplacement_batterie != 1:
             maintenance_year1 = params["maintenance_eur_an"]
             if mode_vente == "fournisseur_secondaire":
@@ -869,7 +924,7 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
                 "curtail_pv_kwh": curtail_y1,
             })
         else:
-            rows.append(_dispatch_one_year(task))
+            rows.append(_dispatch_one_year(year, year_ctx))
         label = "economie client" if mode_vente == "vente_directe" else "gain brut fournisseur"
         valeur_log = rows[-1]['economie_client_eur'] if mode_vente == "vente_directe" else rows[-1]['gain_brut_fournisseur_eur']
         print(f"  Annee {year:>2} : {label} = {valeur_log:>10,.0f} EUR")
