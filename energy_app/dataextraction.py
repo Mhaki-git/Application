@@ -9,7 +9,14 @@ import openpyxl
 import pandas as pd
 import numpy as np
 
+from excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
+
 XLSM_PATH = "ENERGY MIX ANALYSIS - AMELIORATION (2).xlsm"
+
+# Cles dont la valeur brute (y compris None) doit etre conservee telle quelle,
+# sans retomber a 0 si la cellule Excel est vide -- toutes les autres cles de
+# PARAM_CELL_MAP utilisent `valeur or 0`.
+_KEYS_WITHOUT_ZERO_FALLBACK = {"heure_debut_hp", "heure_debut_hc"}
 
 MAX_SCAN_ROWS_QH = 40000
 MAX_SCAN_ROWS_H = 8900
@@ -23,37 +30,10 @@ _CHAMPS_A_VERIFIER_SI_ZERO = {
 
 
 def _read_parameters(ws_de) -> dict:
-    params = {
-        "kwc": ws_de["F5"].value or 0,
-        "kva_onduleur": ws_de["F6"].value or 0,
-        "battery_power_kw": ws_de["F13"].value or 0,
-        "battery_capacity_kwh": ws_de["F14"].value or 0,
-
-        "old_cout_additionnel_contrat": ws_de["J6"].value or 0,
-        "old_price_kwh_fixe": ws_de["J7"].value or 0,
-        "old_price_inj_fixe": ws_de["J8"].value or 0,
-        "price_hp": ws_de["J9"].value or 0,
-        "price_hc": ws_de["J10"].value or 0,
-        "price_inj_hp": ws_de["J11"].value or 0,
-        "price_inj_hc": ws_de["J12"].value or 0,
-        "prix_kwc_pv": ws_de["J13"].value or 0,
-        "prix_kwh_batterie": ws_de["J14"].value or 0,
-        "heure_debut_hp": ws_de["J15"].value,
-        "heure_debut_hc": ws_de["J16"].value,
-        "contrat_kw": ws_de["N16"].value or 0,
-
-        "prix_vente_kwh": ws_de["J27"].value or 0,
-        "prix_injection_fournisseur": ws_de["J28"].value or 0,
-        "marge_fournisseur": ws_de["J29"].value or 0,
-        "taxes_couts_proportionnels": ws_de["J30"].value or 0,
-        "tarif_capacitaire_fournisseur": ws_de["J31"].value or 0,
-        "marge_injection": ws_de["J32"].value or 0,
-
-        "inflation_pct": ws_de["N12"].value or 0,
-        "maintenance_eur_an": ws_de["N13"].value or 0,
-        "degradation_pv_pct": ws_de["N14"].value or 0,
-        "degradation_batterie_pct": ws_de["N15"].value or 0,
-    }
+    params = {}
+    for key, cell in PARAM_CELL_MAP.items():
+        value = ws_de[cell].value
+        params[key] = value if key in _KEYS_WITHOUT_ZERO_FALLBACK else (value or 0)
 
     for champ, description in _CHAMPS_A_VERIFIER_SI_ZERO.items():
         if not params[champ]:
@@ -123,7 +103,7 @@ def _read_pv_series(ws_pv, kwc: float, max_scan_rows: int = MAX_SCAN_ROWS_H) -> 
 
 def extract_all(xlsm_path: str = XLSM_PATH, kwc: float = None):
     wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
-    ws_de = wb["DONNEES ENERGIE"]
+    ws_de = wb[PARAMETERS_SHEET_NAME]
     ws_pv = wb["PVS"]
 
     params = _read_parameters(ws_de)
