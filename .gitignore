@@ -18,3 +18,10 @@ Thumbs.db
 
 # Excel lock files
 ~$*.xls*
+
+# Source Excel template (large binary, kept locally / shared separately)
+/*.xlsm
+
+# Generated output artifacts
+energy_app/fournisseur_roi_resultats.csv
+energy_app/fournisseur_rapport_complet.txt
