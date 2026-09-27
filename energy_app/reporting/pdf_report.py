@@ -18,7 +18,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER
 
-from pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_eur as _fmt_eur, fmt_pct as _fmt_pct
+from reporting.pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_eur as _fmt_eur, fmt_pct as _fmt_pct
 
 
 def _chart_cashflow(result_df, capex_total):

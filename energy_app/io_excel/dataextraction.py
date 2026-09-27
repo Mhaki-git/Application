@@ -9,7 +9,7 @@ import openpyxl
 import pandas as pd
 import numpy as np
 
-from excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
+from io_excel.excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
 
 XLSM_PATH = "ENERGY MIX ANALYSIS - AMELIORATION (2).xlsm"
 
@@ -326,7 +326,7 @@ def build_timeseries_from_sources(conso_csv_path_or_buffer, pv_hourly_profile_1k
     sans Excel : le reste du pipeline (run_fournisseur_model, etc.) n'a besoin
     d'aucune modification, il consomme ce DataFrame de la meme facon.
     """
-    from pv_pvgis import expand_to_quarter_hour
+    from io_sources.pv_pvgis import expand_to_quarter_hour
 
     print("Lecture de la consommation client (CSV)...")
     conso_raw = read_conso_csv(conso_csv_path_or_buffer, unit=unit)

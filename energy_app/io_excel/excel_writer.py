@@ -7,7 +7,7 @@ onglet PVS) : uniquement le bloc de parametres.
 import shutil
 import openpyxl
 
-from excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
+from io_excel.excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
 
 
 def write_params_to_copy(source_xlsm_path: str, dest_xlsm_path: str, params: dict) -> str:

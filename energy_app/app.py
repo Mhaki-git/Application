@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from dataextraction import build_timeseries_from_sources
-from fournisseur_roi import run_fournisseur_model_from_data
-from pdf_report import build_pdf_report
+from io_excel.dataextraction import build_timeseries_from_sources
+from engine.fournisseur_roi import run_fournisseur_model_from_data
+from reporting.pdf_report import build_pdf_report
 
 st.set_page_config(page_title="Analyse Energetique - PV & Batterie", layout="wide", page_icon="⚡")
 
@@ -125,7 +125,7 @@ with col2:
 
         @st.cache_data
         def _fetch_pv_pvgis(lat, lon, tilt, azimuth, loss):
-            from pv_pvgis import fetch_pv_profile_1kwc
+            from io_sources.pv_pvgis import fetch_pv_profile_1kwc
             return fetch_pv_profile_1kwc(lat, lon, tilt=tilt, azimuth=azimuth, system_loss_pct=loss)
 
         try:
@@ -1026,7 +1026,7 @@ if results:
         fp_site_name = st.text_input("Nom du site (ex: Residence Amadeus)", value="", key="fp_site_name")
 
         if st.button("📋 Generer la fiche financiere (PDF)", use_container_width=True):
-            from financial_sheet import compute_fiche, build_fiche_pdf
+            from engine.financial_sheet import compute_fiche, build_fiche_pdf
             _fiche_params = {
                 "marge": fp_marge, "puissance_batterie_kva": fp_batt_kva,
                 "subsides_pct": fp_subsides_pct, "kwc": fp_kwc,

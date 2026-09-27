@@ -34,7 +34,8 @@ from entsoe import EntsoePandasClient
 # Code de zone ENTSO-E pour la Belgique (bidding zone BE)
 BIDDING_ZONE_BE = "BE"
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(_APP_ROOT, "data")
 
 
 def fetch_belpex_year(year: int, api_key: str) -> pd.Series:

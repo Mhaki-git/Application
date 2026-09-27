@@ -64,7 +64,18 @@ archive -- il s'ouvre normalement dans Excel qui recalcule tout tout seul).
 ## Fichiers
 
 - `app.py` -- interface Streamlit (le point d'entree)
-- `dataextraction.py` -- lecture des donnees/parametres depuis l'Excel
-- `fournisseur_roi.py` -- moteur de calcul (dispatch Day-Ahead, ROI, VAN/TRI)
-- `excel_writer.py` -- generation de la copie Excel "archive" (optionnelle)
-- `pdf_report.py` -- generation du rapport PDF
+- `engine/` -- moteurs de calcul
+  - `fournisseur_roi.py` -- dispatch Day-Ahead, ROI, VAN/TRI
+  - `financial_sheet.py` -- fiche financiere (financement par emprunt, loyer, CV)
+  - `finance_utils.py` -- utilitaires partages (NPV/IRR, PMT/amortissement)
+- `io_excel/` -- lecture/ecriture du fichier Excel modele
+  - `dataextraction.py` -- lecture des donnees/parametres depuis l'Excel
+  - `excel_writer.py` -- generation de la copie Excel "archive" (optionnelle)
+  - `excel_schema.py` -- carte des cellules parametres, partagee par les deux fichiers ci-dessus
+- `io_sources/` -- sources de donnees externes (PV, prix de marche)
+  - `extract_pv_from_excel.py` -- fige le profil PV depuis l'Excel (script a executer une fois)
+  - `fetch_belpex.py` -- recupere les prix Belpex Day-Ahead (script a executer une fois par annee)
+  - `pv_pvgis.py` -- recuperation du profil PV via l'API PVGIS (alternative a l'Excel)
+- `reporting/` -- generation des rapports PDF
+  - `pdf_report.py` -- rapport PDF principal (modele fournisseur)
+  - `pdf_style.py` -- formatage et style ReportLab partages

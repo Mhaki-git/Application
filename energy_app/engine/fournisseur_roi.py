@@ -7,8 +7,8 @@ import pandas as pd
 from scipy import sparse
 from scipy.optimize import linprog
 
-from dataextraction import extract_all, XLSM_PATH as DEFAULT_XLSM_PATH
-from finance_utils import compute_npv_irr
+from io_excel.dataextraction import extract_all, XLSM_PATH as DEFAULT_XLSM_PATH
+from engine.finance_utils import compute_npv_irr
 
 import sys
 

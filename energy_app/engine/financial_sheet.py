@@ -15,8 +15,8 @@ NB_ANNEES = 25, comme les colonnes B:Z de l'onglet source.
 import numpy as np
 import pandas as pd
 
-from finance_utils import pmt as _pmt, amortization_schedule as _amortization_schedule, irr_from_cashflows
-from pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct
+from engine.finance_utils import pmt as _pmt, amortization_schedule as _amortization_schedule, irr_from_cashflows
+from reporting.pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct
 
 NB_ANNEES = 25
 

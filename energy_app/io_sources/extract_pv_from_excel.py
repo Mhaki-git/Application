@@ -20,7 +20,8 @@ import pandas as pd
 import numpy as np
 
 MAX_SCAN_ROWS_H = 8900
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUTPUT_DIR = os.path.join(_APP_ROOT, "data")
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "pv_profile_1kwc.pkl")
 
 
