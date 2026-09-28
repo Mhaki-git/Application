@@ -24,6 +24,18 @@ from reporting.pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct, fm
 NB_ANNEES = 25
 RENDEMENT_BRUT_PCT_MAX = 1000.0  # plafond d'affichage si payback ~ 0 (retour quasi instantane)
 
+# Coefficients "en dur" de la formule Excel d'origine, repris tels quels
+# (reproduction fidele) -- documentes ici pour eviter qu'un futur mainteneur
+# les modifie par erreur en les prenant pour un bug plutot qu'une hypothese
+# metier volontaire du classeur source.
+PV_COST_EUR_PER_KWC = 450.0        # cout materiel PV suppose, EUR/kWc (avant marge)
+PV_COST_FIXED_EUR = 3500.0         # cout fixe forfaitaire (etude, raccordement...), EUR
+BESS_COST_EUR_PER_KVA = 500.0      # cout materiel batterie suppose, EUR/kVA
+PV_PRODUCTION_DEFAULT_KWH_PER_KWC = 900.0  # rendement PV par defaut si non precise,
+                                            # kWh/kWc/an -- ordre de grandeur Belgique
+PV_DEGRADATION_YEAR2_FACTOR = 0.99   # production annee 2 = annee 1 * ce facteur (-1%)
+PV_DEGRADATION_YEAR3PLUS_FACTOR = 0.996  # production annee N+1 = annee N * ce facteur (-0.4%/an)
+
 DEFAULT_PARAMS = {
     "marge": 1.3,                          # B3
     "puissance_batterie_kva": 0.0,         # G4
@@ -65,14 +77,14 @@ def compute_fiche(params: dict) -> dict:
     annees_exploitation_fw = int(p["annees_exploitation_fw"])
 
     # --- Bloc "Details projets" / CAPEX (B3:B9) ---------------------------
-    pv_cost = 450 * kwc * marge + 3500                     # B4
-    bess_cost = 500 * puissance_batterie_kva                # B5
+    pv_cost = PV_COST_EUR_PER_KWC * kwc * marge + PV_COST_FIXED_EUR   # B4
+    bess_cost = BESS_COST_EUR_PER_KVA * puissance_batterie_kva        # B5
     capex = (1 - subsides_pct) * marge + pv_cost + bess_cost  # B7 (formule reproduite telle quelle)
 
     # --- Bloc "Donnees de production" (D3:H9) ------------------------------
     production_pv_estimee = p["production_pv_estimee_kwh"]
     if production_pv_estimee is None:
-        production_pv_estimee = kwc * 900                   # G7 par defaut (formule Excel d'origine)
+        production_pv_estimee = kwc * PV_PRODUCTION_DEFAULT_KWH_PER_KWC  # G7 par defaut (formule Excel d'origine)
     production_eolienne = p["production_eolienne_kwh"]      # G3
     production_totale_estimee = production_pv_estimee + production_eolienne  # G8
 
@@ -92,9 +104,9 @@ def compute_fiche(params: dict) -> dict:
     production = np.empty(NB_ANNEES)
     production[0] = production_totale_estimee
     if NB_ANNEES > 1:
-        production[1] = production[0] * 0.99
+        production[1] = production[0] * PV_DEGRADATION_YEAR2_FACTOR
         for i in range(2, NB_ANNEES):
-            production[i] = production[i - 1] * 0.996
+            production[i] = production[i - 1] * PV_DEGRADATION_YEAR3PLUS_FACTOR
 
     financement = np.zeros(NB_ANNEES)
     financement[0] = montant_financement
