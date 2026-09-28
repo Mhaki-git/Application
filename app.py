@@ -370,12 +370,15 @@ with col1.container(border=True):
                 options=_profile_keys,
                 format_func=lambda k: CONSO_PROFILE_LABELS.get(k, k),
             )
+            _note("Le profil-type ne donne que la <i>forme</i> (répartition dans le temps) -- "
+                  "indiquez ci-dessous la consommation réelle du client sur un an pour le mettre "
+                  "à l'échelle.")
             conso_annuelle_kwh = st.number_input(
-                "Consommation annuelle cible (kWh/an)",
+                "Consommation annuelle du client (kWh/an)",
                 value=100000.0, step=1000.0, min_value=0.0,
-                help="Le profil intégré est une forme normalisée (répartition quart-horaire sur "
-                     "l'année) -- il est mis à l'échelle avec cette valeur pour obtenir la "
-                     "consommation réelle en kWh.",
+                help="Consommation réelle du site sur 12 mois (voir facture ou compteur). "
+                     "Le profil-type sert uniquement à répartir cette valeur heure par heure "
+                     "sur l'année.",
             )
             conso_series_profile = _scaled_conso_profile(profile_key, conso_annuelle_kwh)
             _note(f"Profil quart-horaire chargé, mis à l'échelle sur "
@@ -1152,7 +1155,10 @@ def _render_results(results):
                 _cout_explication = (
                     "Avant : consommation totale × ancien tarif réseau. Après : import résiduel "
                     "(post PV + batterie) × tarif réseau, moins le surplus exporté crédité au tarif "
-                    "de rachat. Le client possède l'installation : son autoconsommation ne lui coûte rien."
+                    "de rachat. Le client possède l'installation : son autoconsommation ne lui coûte rien. "
+                    "Si la puissance souscrite est dépassée à certains moments, le total « après PV » "
+                    "ci-dessous reprend le coût réel du dispatch (pénalité de dépassement incluse), "
+                    "légèrement supérieur à ce que ce recalcul mensuel simplifié suggère."
                 )
 
             mois_labels = ["Jan", "Fév", "Mar", "Avr", "Mai", "Juin",
@@ -1161,6 +1167,25 @@ def _render_results(results):
             apres_mensuel = cout_apres.groupby(serie_cout.index.month).sum().reindex(range(1, 13), fill_value=0.0)
             total_avant = float(avant_mensuel.sum())
             total_apres = float(apres_mensuel.sum())
+
+            # Le detail mensuel ci-dessus ne recalcule que import*tarif - export*rachat,
+            # et ignore donc la penalite de depassement de puissance souscrite
+            # (OVERRUN_PENALTY_MULT, voir engine/fournisseur_roi.py) que le moteur LP
+            # applique reellement. Pour que "Ecart" soit coherent avec "Economie client"
+            # (section resultats plus haut), on recale le total "apres PV" sur le vrai
+            # cout d'energie de l'annee 1 (dont_energie_eur, overrun inclus) quand ce
+            # dernier est disponible -- seule la repartition mensuelle reste approximative.
+            if results.get("mode_vente") != "fournisseur_secondaire":
+                _dont_energie_an1 = df.loc[0, "dont_energie_eur"] if "dont_energie_eur" in df.columns else None
+                if _dont_energie_an1 is not None and not pd.isna(_dont_energie_an1):
+                    _ecart_overrun = _dont_energie_an1 - total_apres
+                    total_apres = float(_dont_energie_an1)
+                    if abs(_ecart_overrun) > 1.0:
+                        st.caption(
+                            f"⚠️ Le dispatch réel inclut {fmt_eur(_ecart_overrun)} de surcoût "
+                            "(dépassement de la puissance souscrite, pénalisé) non visible dans la "
+                            "répartition mensuelle ci-dessous ; le total « après PV » en tient compte."
+                        )
 
             _chart_title(f"Coût réseau du client · avant / après PV ({kwc:.0f} kWc)", "Année 1")
             k1, k2, k3 = st.columns(3)

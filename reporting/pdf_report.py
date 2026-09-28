@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
 )
 from reportlab.lib.enums import TA_CENTER
 
@@ -171,7 +171,12 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
     story.append(PageBreak())
 
     # --- Installation & CAPEX ---
-    story.append(Paragraph("Installation & investissement", h2))
+    # Chaque section est assemblee dans une liste locale puis enveloppee dans
+    # KeepTogether : reportlab ne coupera pas la section au milieu si elle
+    # tient sur ce qui reste de la page courante, et l'enchainera a la suite
+    # de la section precedente (pas de saut de page force -- evite les grands
+    # blancs de bas de page que laissait un PageBreak() systematique ici).
+    sec_install = [Paragraph("Installation & investissement", h2)]
     er = results.get("bilan_energetique_annee1", {})  # dict optionnel : cle "import_kwh" utilisee ci-dessous, defaut {} si absente.
     install_data = [
         ["Puissance PV installee", f"{params['kwc']:.1f} kWc"],
@@ -194,10 +199,12 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
         ("LINEBELOW", (0, -1), (-1, -1), 1, NAVY),
         ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
     ]))
-    story.append(t)
+    sec_install.append(t)
+    story.append(KeepTogether(sec_install))
+    story.append(Spacer(1, 0.5 * cm))
 
     # --- Cote client ---
-    story.append(Paragraph("Cote client", h2))
+    sec_client = [Paragraph("Cote client", h2)]
     old_c = results["old_cost_year1"]
     new_c = results["revenue_client_year1"]
     savings_1 = old_c - new_c
@@ -218,11 +225,11 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.append(t2)
-    story.append(Spacer(1, 0.3 * cm))
-    story.append(Image(_chart_client_savings(result_df), width=15.5 * cm, height=7.3 * cm))
-
-    story.append(PageBreak())
+    sec_client.append(t2)
+    sec_client.append(Spacer(1, 0.3 * cm))
+    sec_client.append(Image(_chart_client_savings(result_df), width=15.5 * cm, height=7.3 * cm))
+    story.append(KeepTogether(sec_client))
+    story.append(Spacer(1, 0.5 * cm))
 
     # --- Rentabilite ---
     # Le libelle de section et l'intitule de la ligne "gain" dependent du mode de vente :
@@ -233,7 +240,7 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
                            else "Rentabilite (cote investisseur / fournisseur)")
     _label_gain = (f"Retour net cumule client ({horizon} ans, apres remplacement batterie)" if _is_vente_directe
                    else f"Gain brut cumule ({horizon} ans)")
-    story.append(Paragraph(_titre_rentabilite, h2))
+    sec_roi = [Paragraph(_titre_rentabilite, h2)]
     payback = results["payback_year"]
     # payback_year vaut None si le CAPEX n'est jamais rembourse dans l'horizon simule.
     payback_str = f"{payback:.1f} ans" if payback is not None else f"Non atteint sur {horizon} ans"
@@ -257,21 +264,21 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
         ("LINEBELOW", (0, 2), (-1, 2), 1, NAVY),
         ("FONTNAME", (0, 2), (-1, 2), "Helvetica-Bold"),
     ]))
-    story.append(t3)
-    story.append(Spacer(1, 0.3 * cm))
-    story.append(Image(_chart_cashflow(result_df, results["capex_total"]), width=15.5 * cm, height=7.3 * cm))
-
-    story.append(PageBreak())
+    sec_roi.append(t3)
+    sec_roi.append(Spacer(1, 0.3 * cm))
+    sec_roi.append(Image(_chart_cashflow(result_df, results["capex_total"]), width=15.5 * cm, height=7.3 * cm))
+    story.append(KeepTogether(sec_roi))
+    story.append(Spacer(1, 0.5 * cm))
 
     # --- Origine du gain ---
-    story.append(Paragraph("Origine du gain (annee 1)", h2))
-    story.append(Paragraph(
+    sec_gain = [Paragraph("Origine du gain (annee 1)", h2)]
+    sec_gain.append(Paragraph(
         "Decomposition en cascade, sans double comptage : le gain PV correspond a "
         "l'autoconsommation + l'injection directe, le gain batterie a l'arbitrage "
         "Day-Ahead et a l'ecretement de pointe, EN PLUS de ce que le PV seul apporterait.",
         body))
-    story.append(Spacer(1, 0.2 * cm))
-    story.append(Image(_chart_gain_split(decomp), width=9 * cm, height=7 * cm))
+    sec_gain.append(Spacer(1, 0.2 * cm))
+    sec_gain.append(Image(_chart_gain_split(decomp), width=9 * cm, height=7 * cm))
 
     gain_data = [
         ["Cout si 100% reseau", _fmt_eur(decomp["cout_sans_rien_eur"])],
@@ -289,24 +296,29 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.append(t4)
+    sec_gain.append(t4)
 
     # Avertissement additionnel si une des deux composantes du gain (PV ou batterie) est
     # negative : signale un cas limite du dispatch (ex: tarif capacitaire penalisant)
     # que le camembert ci-dessus ne peut pas representer correctement (valeurs plafonnees a 0).
     if decomp["gain_pv_eur"] < 0 or decomp["gain_batterie_belpex_eur"] < 0:
-        story.append(Spacer(1, 0.3 * cm))
-        story.append(Paragraph(
+        sec_gain.append(Spacer(1, 0.3 * cm))
+        sec_gain.append(Paragraph(
             "ATTENTION : un gain decompose ci-dessus est negatif -- cas limite du dispatch "
             "(le tarif capacitaire ou une contrainte de contrat peut rendre l'ajout de PV/batterie "
             "ponctuellement defavorable dans cette decomposition). Le graphique plafonne a 0 pour "
             "rester lisible. Verifier le gain total et les hypotheses (contrat souscrit, tarif "
             "capacitaire) avant d'envoyer ce rapport a un client.",
             ParagraphStyle("Warn2", parent=body, textColor=colors.red)))
+    story.append(KeepTogether(sec_gain))
 
     story.append(PageBreak())
 
     # --- Detail annuel (tableau complet) ---
+    # Ce tableau peut s'etaler sur plusieurs pages (repeatRows=1 repete
+    # l'en-tete) : il garde son propre PageBreak() pour demarrer proprement
+    # en haut d'une page plutot que de s'inserer au milieu d'une page a
+    # moitie pleine.
     story.append(Paragraph("Detail annee par annee", h2))
     header = ["Annee", "Revenu client", "Cout approv.", "Gain brut", "Economie client", "Cashflow cumule"]
     rows = [header]  # premiere ligne = en-tete, reutilisee comme repeatRows=1 plus bas (repetee sur chaque page).
