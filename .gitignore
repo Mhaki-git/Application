@@ -29,5 +29,8 @@ fournisseur_rapport_complet.txt
 # Test cache
 .pytest_cache/
 
+# Marker created by startup.bat after first successful dependency install
+.setup_ok
+
 # Claude Code local session state
 .claude/
