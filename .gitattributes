@@ -1,0 +1,8 @@
+# Ces scripts doivent garder des fins de ligne LF (obligatoire pour le
+# shebang #!/bin/bash sur macOS/Linux -- un \r final ferait echouer
+# l'execution avec une erreur "bad interpreter").
+startup.sh text eol=lf
+startup.command text eol=lf
+
+# Le .bat Windows doit garder CRLF (convention native cmd.exe).
+startup.bat text eol=crlf
