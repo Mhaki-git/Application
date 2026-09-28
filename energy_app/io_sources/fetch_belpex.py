@@ -59,9 +59,10 @@ def fetch_belpex_year(year: int, api_key: str) -> pd.Series:
     prices_mwh.index = prices_mwh.index.tz_convert("Europe/Brussels").tz_localize(None)
     prices_kwh = prices_mwh / 1000.0
 
-    # Le moteur (load_dayahead_prices) fait deja un reindex + ffill vers la
-    # grille quart-horaire du client -- pas besoin de desagreger nous-memes
-    # ici, on sauvegarde tel quel au pas horaire natif d'ENTSO-E.
+    # Le moteur (load_dayahead_prices / _align_market_price_to_calendar) cale
+    # la source sur la grille du client par (mois, jour, heure) -- gere nativement
+    # une source horaire (repete le prix sur les 4 quarts d'heure) -- pas besoin
+    # de desagreger nous-memes ici, on sauvegarde tel quel au pas horaire natif d'ENTSO-E.
     prices_kwh = prices_kwh[~prices_kwh.index.duplicated(keep="first")].sort_index()
     prices_kwh.name = "price_eur_kwh"
 
