@@ -47,14 +47,34 @@ DISCOUNT_RATE_DEFAULT = 0.06
 
 
 def _build_lp_skeleton(n: int):
+    """
+    Variables du LP journalier, dans l'ordre (chaque bloc de taille n, sauf
+    new_peak qui est scalaire) : charge, decharge, imp, exp, soc, curtail,
+    imp_overrun, new_peak.
+
+    imp_overrun : depassement d'import AU-DELA de contrat_kw*dt, autorise
+    mais fortement penalise (OVERRUN_PENALTY_MULT) -- sans cette variable,
+    un scenario physiquement impossible a satisfaire dans la limite du
+    contrat (ex: forte conso nocturne + batterie vide + petit contrat)
+    rendait le LP purement INFAISABLE (RuntimeError), alors que
+    _dispatch_no_battery et solve_day_dispatch_heuristic geraient deja ce
+    cas en douceur avec la meme penalite -- incoherence corrigee ici.
+    """
     i_n = sparse.eye(n, format="csr")
     z_n = sparse.csr_matrix((n, n))
     s_n = sparse.eye(n, k=-1, format="csr")
     zeros_col = sparse.csr_matrix((n, 1))
     ones_col = sparse.csr_matrix(np.ones((n, 1)))
 
-    a_balance = sparse.hstack([-i_n, i_n, i_n, -i_n, z_n, -i_n, zeros_col], format="csr")
-    a_peak = sparse.hstack([z_n, z_n, i_n, z_n, z_n, z_n, -DT * ones_col], format="csr")
+    a_balance = sparse.hstack([-i_n, i_n, i_n, -i_n, z_n, -i_n, i_n, zeros_col], format="csr")
+    # imp_overrun contribue AUSSI au pic de puissance facturable (tarif
+    # capacitaire) : c'est de la puissance reellement soutiree du reseau a
+    # cet instant, peu importe qu'elle depasse ou non le contrat souscrit --
+    # sans ca, le LP peut "arbitrer" en faisant passer de l'import par
+    # imp_overrun (penalise mais fixe) plutot que imp (dans la limite du
+    # contrat) simplement pour echapper au tarif capacitaire sur le pic,
+    # ce qui n'a pas de sens physique.
+    a_peak = sparse.hstack([z_n, z_n, i_n, z_n, z_n, z_n, i_n, -DT * ones_col], format="csr")
 
     return {
         "I_N": i_n, "Z_N": z_n, "S_N": s_n, "zeros_col": zeros_col,
@@ -133,10 +153,22 @@ def _align_market_price_to_calendar(market_price: pd.Series, target_index: pd.Da
 
 
 def load_dayahead_prices(dayahead_pkl_path, target_index: pd.DatetimeIndex) -> tuple:
+    """
+    dayahead_pkl_path : soit un chemin vers un .pkl (usage interne -- fichiers
+    figes data/belpex_*_qh.pkl controles par l'appli, jamais fournis par un
+    utilisateur externe), soit directement une pd.Series deja chargee (cas
+    d'un upload utilisateur : lire un .pkl fourni par un tiers avec
+    pd.read_pickle serait une deserialisation non fiable qui peut executer du
+    code arbitraire -- app.py lit ces uploads en CSV via
+    dataextraction.read_dayahead_csv et passe directement la Series ici).
+    """
     try:
-        if not dayahead_pkl_path:
+        if isinstance(dayahead_pkl_path, pd.Series):
+            market_price = dayahead_pkl_path
+        elif not dayahead_pkl_path:
             raise FileNotFoundError(dayahead_pkl_path)
-        market_price = pd.read_pickle(dayahead_pkl_path)
+        else:
+            market_price = pd.read_pickle(dayahead_pkl_path)
         if market_price.index.tz is not None:
             market_price = market_price.tz_localize(None)
         market_price = market_price[~market_price.index.duplicated(keep="first")]
@@ -245,7 +277,7 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
     b_balance = conso - pv
 
     A_soc = sparse.hstack([-eta_c * I_N, (1 / eta_d) * I_N, sk["Z_N"], sk["Z_N"],
-                            I_N - S_N, sk["Z_N"], zeros_col], format="csr")
+                            I_N - S_N, sk["Z_N"], sk["Z_N"], zeros_col], format="csr")
     b_soc = np.zeros(N)
     b_soc[0] = soc_init
 
@@ -264,13 +296,15 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
         + [(0, contrat_kw * dt)] * N
         + [(0, e_max)] * N
         + [(0, curtail_upper[t]) for t in range(N)]
+        + [(0, None)] * N  # imp_overrun : depassement d'import, non borne mais penalise
         + [(peak_so_far_kw, None)]
     )
 
-    c = np.zeros(6 * N + 1)
+    c = np.zeros(7 * N + 1)
     c[2 * N:3 * N] = price_import
     c[3 * N:4 * N] = -price_export
-    c[6 * N] = demand_charge_rate
+    c[6 * N:7 * N] = price_import * OVERRUN_PENALTY_MULT
+    c[7 * N] = demand_charge_rate
 
     res = linprog(c, A_ub=A_peak, b_ub=b_peak, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
     if not res.success:
@@ -283,8 +317,10 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
     charge, decharge = x[0:N], x[N:2 * N]
     imp, exp, soc = x[2 * N:3 * N], x[3 * N:4 * N], x[4 * N:5 * N]
     curtail = x[5 * N:6 * N]
-    new_peak = x[6 * N]
-    day_cost = float((imp * price_import - exp * price_export).sum())
+    imp_overrun = x[6 * N:7 * N]
+    new_peak = x[7 * N]
+    day_cost = float((imp * price_import - exp * price_export).sum()
+                      + (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum())
     dispatch = pd.DataFrame({
         "charge_kwh": charge, "decharge_kwh": decharge,
         "import_kwh": imp, "export_kwh": exp, "soc_kwh": soc,
