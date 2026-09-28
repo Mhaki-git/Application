@@ -11,12 +11,24 @@ modele, et produit un rapport PDF, des graphiques et le detail annuel.
 
 1. Se rendre sur https://www.python.org/downloads/ et telecharger Python.
 2. Executer le fichier telecharge.
-3. Sur le premier ecran de l'installateur, cocher la case *"Add python.exe
-   to PATH"* avant de cliquer sur "Install Now".
+3. **Windows** : sur le premier ecran de l'installateur, cocher la case
+   *"Add python.exe to PATH"* avant de cliquer sur "Install Now".
+4. **macOS** : l'installateur officiel convient, ou `brew install python`
+   pour les utilisateurs de Homebrew.
+5. **Linux** : Python 3 est generalement deja installe ; sinon, utiliser le
+   gestionnaire de paquets de la distribution (ex : `apt install python3
+   python3-venv` sur Debian/Ubuntu).
 
 **Etape 2 -- Lancement de l'application**
 
-Double-cliquer sur `startup.bat` (dans ce dossier).
+- **Windows** : double-cliquer sur `startup.bat` (dans ce dossier).
+- **macOS** : double-cliquer sur `startup.command`. Si le systeme bloque
+  l'ouverture (fichier telecharge depuis une source non identifiee),
+  clic droit puis "Ouvrir".
+- **Linux** : executer `./startup.sh` depuis un terminal ouvert dans ce
+  dossier (`chmod +x startup.sh` si necessaire au prealable).
+
+Dans tous les cas :
 
 - Au premier lancement, une fenetre de terminal s'ouvre et installe les
   dependances necessaires (quelques minutes).
@@ -24,8 +36,8 @@ Double-cliquer sur `startup.bat` (dans ce dossier).
   navigateur par defaut.
 - Pour arreter l'application : fermer la fenetre de terminal.
 
-Si un message indique que Python n'est pas installe, verifier que la case
-"Add to PATH" a bien ete cochee a l'etape 1, puis relancer.
+Si un message indique que Python n'est pas installe, verifier l'etape 1
+(sous Windows, la case "Add to PATH" en particulier), puis relancer.
 
 ## Partage sur le reseau local
 
@@ -41,8 +53,9 @@ sans installation locale. Le calcul s'execute sur le poste hote (qui fait
 office de serveur) -- l'adresse cesse de fonctionner si ce poste est
 eteint ou si l'application est fermee.
 
-En cas d'echec de connexion, verifier le pare-feu Windows : Python /
-Streamlit doit etre autorise sur les reseaux "prives".
+En cas d'echec de connexion, verifier le pare-feu du poste hote : Python /
+Streamlit doit etre autorise sur le reseau local (reseaux "prives" sous
+Windows).
 
 ## Utilisation
 
@@ -58,26 +71,25 @@ Streamlit doit etre autorise sur les reseaux "prives".
    optimise jour par jour) peut prendre plusieurs minutes selon l'horizon
    choisi ; une barre de progression indique l'avancement.
 5. Consulter les resultats (indicateurs, graphiques, detail annuel).
-6. Generer et telecharger le rapport PDF, le CSV detaille, et/ou une copie
-   de l'Excel avec les parametres utilises (pour archivage).
+6. Generer et telecharger le rapport PDF et le CSV detaille.
 
 ## Fichier Excel source
 
 L'application ne modifie jamais le fichier Excel original. Les parametres
 saisis dans le formulaire sont appliques uniquement en memoire pour le
-calcul ; le fichier "Excel rempli" telechargeable est une copie generee
-separement, destinee a l'archivage.
+calcul et ne sont jamais reecrits dans le fichier source.
 
 ## Structure du projet
 
 - `app.py` -- interface Streamlit (point d'entree)
+- `startup.bat` / `startup.sh` / `startup.command` -- installation et lancement (Windows / Linux / macOS)
 - `engine/` -- moteurs de calcul
   - `fournisseur_roi.py` -- dispatch Day-Ahead, ROI, VAN/TRI
   - `financial_sheet.py` -- fiche financiere (financement par emprunt, loyer, CV)
   - `finance_utils.py` -- utilitaires partages (NPV/IRR, PMT/amortissement)
 - `io_excel/` -- lecture/ecriture du fichier Excel modele
   - `dataextraction.py` -- lecture des donnees/parametres depuis l'Excel
-  - `excel_writer.py` -- generation de la copie Excel d'archive (optionnelle)
+  - `excel_writer.py` -- generation d'une copie Excel parametree ; non utilise par l'interface actuelle (voir docstring du module)
   - `excel_schema.py` -- carte des cellules parametres, partagee par les deux modules ci-dessus
 - `io_sources/` -- sources de donnees externes (PV, consommation, prix de marche)
   - `extract_pv_from_excel.py` -- extraction du profil PV depuis l'Excel (script a executer une fois)
@@ -93,10 +105,17 @@ separement, destinee a l'archivage.
 
 Suite de tests de non-regression sur les moteurs de calcul (`engine/`),
 destinee a verifier l'absence de regression silencieuse avant tout
-refactoring. Necessite l'environnement Python cree par `startup.bat`
-(`.venv/`).
+refactoring. Necessite l'environnement Python cree par le script de
+lancement (`.venv/`).
 
+Windows :
 ```
 .venv\Scripts\python -m pip install -r requirements-dev.txt
 .venv\Scripts\python -m pytest
+```
+
+macOS / Linux :
+```
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
 ```
