@@ -15,10 +15,14 @@ NB_ANNEES = 25, comme les colonnes B:Z de l'onglet source.
 import numpy as np
 import pandas as pd
 
-from engine.finance_utils import pmt as _pmt, amortization_schedule as _amortization_schedule, irr_from_cashflows
-from reporting.pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct
+from engine.finance_utils import (
+    pmt as _pmt, amortization_schedule as _amortization_schedule,
+    irr_from_cashflows, irr_failure_reason,
+)
+from reporting.pdf_style import NAVY, ACCENT, LIGHTGREY, fmt_pct as _fmt_pct, fmt_eur as _fmt_eur, fmt_number as _fmt_number
 
 NB_ANNEES = 25
+RENDEMENT_BRUT_PCT_MAX = 1000.0  # plafond d'affichage si payback ~ 0 (retour quasi instantane)
 
 DEFAULT_PARAMS = {
     "marge": 1.3,                          # B3
@@ -200,9 +204,10 @@ def compute_fiche(params: dict) -> dict:
     # Reproduit Excel : MIN() sur une plage sans aucun marqueur renvoie 0 (cas
     # ou le resultat cumule est deja positif des l'annee 1 -- pas de "retour
     # sur investissement" a proprement parler puisque le CAPEX est finance).
-    rendement_brut_pct = 100 / payback if payback else None  # #DIV/0! si payback = 0
+    rendement_brut_pct = min(100 / payback, RENDEMENT_BRUT_PCT_MAX) if payback else None
 
     irr = irr_from_cashflows(resultat_annuel, start_period=1)
+    irr_failure_reason_ = None if irr == irr else irr_failure_reason(list(resultat_annuel))
 
     return {
         "params": p,
@@ -215,6 +220,7 @@ def compute_fiche(params: dict) -> dict:
         "prix_revient_kwh": prix_revient_kwh, "marge_brute_pct": marge_brute_pct,
         "gain_total_25ans_eur": float(resultat_annuel.sum()),
         "payback_annees": payback, "rendement_brut_pct": rendement_brut_pct, "irr_pct": irr * 100 if irr == irr else None,
+        "irr_failure_reason": irr_failure_reason_,
         "detail_annuel": df,
     }
 
@@ -280,16 +286,16 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
 
     story.append(Paragraph("Details projet & CAPEX", h2))
     story.append(param_table([
-        ["Marge", f"{p['marge']:.2f}", "PV", f"{fiche['capex_pv']:,.0f} EUR".replace(",", " ")],
-        ["BESS", f"{fiche['capex_bess']:,.0f} EUR".replace(",", " "), "Subsides", _fmt_pct(100 * p["subsides_pct"])],
-        ["CAPEX total", f"{fiche['capex_total']:,.0f} EUR".replace(",", " "), "OPEX (25 ans)", f"{fiche['opex_total']:,.0f} EUR".replace(",", " ")],
+        ["Marge", f"{p['marge']:.2f}", "PV", _fmt_eur(fiche['capex_pv'])],
+        ["BESS", _fmt_eur(fiche['capex_bess']), "Subsides", _fmt_pct(100 * p["subsides_pct"])],
+        ["CAPEX total", _fmt_eur(fiche['capex_total']), "OPEX (25 ans)", _fmt_eur(fiche['opex_total'])],
         ["Annees d'exploitation FW", f"{p['annees_exploitation_fw']:.0f} ans", "", ""],
     ], [5.5 * cm, 4 * cm, 5.5 * cm, 4 * cm]))
 
     story.append(Paragraph("Donnees de production", h2))
     story.append(param_table([
-        ["Puissance PV", f"{p['kwc']:.1f} kWc", "Production PV estimee", f"{fiche['production_pv_estimee']:,.0f} kWh/an".replace(",", " ")],
-        ["Production eolienne estimee", f"{p['production_eolienne_kwh']:,.0f} kWh/an".replace(",", " "), "Production totale estimee", f"{fiche['production_totale_estimee']:,.0f} kWh/an".replace(",", " ")],
+        ["Puissance PV", f"{p['kwc']:.1f} kWc", "Production PV estimee", _fmt_number(fiche['production_pv_estimee'], suffix="kWh/an")],
+        ["Production eolienne estimee", _fmt_number(p['production_eolienne_kwh'], suffix="kWh/an"), "Production totale estimee", _fmt_number(fiche['production_totale_estimee'], suffix="kWh/an")],
         ["Valeur CV", f"{p['valeur_cv_eur_mwh']:.1f} EUR/MWh", "", ""],
     ], [5.5 * cm, 4 * cm, 5.5 * cm, 4 * cm]))
 
@@ -302,10 +308,10 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
 
     story.append(Paragraph("Donnees financieres & fiscales", h2))
     story.append(param_table([
-        ["Apport", _fmt_pct(100 * p["apport_pct"]), "Apport (montant)", f"{fiche['apport_eur']:,.0f} EUR".replace(",", " ")],
-        ["Montant du financement", f"{fiche['montant_financement']:,.0f} EUR".replace(",", " "), "Duree du financement", f"{p['duree_financement_annees']:.0f} ans"],
-        ["Taux d'interet", _fmt_pct(100 * p["taux_interet"]), "Annuite a rembourser", f"{fiche['annuite']:,.0f} EUR".replace(",", " ")],
-        ["Total interets", f"{fiche['total_interets']:,.0f} EUR".replace(",", " "), "", ""],
+        ["Apport", _fmt_pct(100 * p["apport_pct"]), "Apport (montant)", _fmt_eur(fiche['apport_eur'])],
+        ["Montant du financement", _fmt_eur(fiche['montant_financement']), "Duree du financement", f"{p['duree_financement_annees']:.0f} ans"],
+        ["Taux d'interet", _fmt_pct(100 * p["taux_interet"]), "Annuite a rembourser", _fmt_eur(fiche['annuite'])],
+        ["Total interets", _fmt_eur(fiche['total_interets']), "", ""],
     ], [5.5 * cm, 4 * cm, 5.5 * cm, 4 * cm]))
 
     story.append(Paragraph("Loyer + Maintenance", h2))
@@ -319,10 +325,23 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
     story.append(Paragraph("Synthese", h2))
     payback_txt = (f"{fiche['payback_annees']:.1f} ans" if fiche["payback_annees"] else
                    "Deja positif des l'annee 1 (pas de payback -- CAPEX finance)")
-    rendement_txt = _fmt_pct(fiche["rendement_brut_pct"]) if fiche["rendement_brut_pct"] else "Non applicable"
-    irr_txt = _fmt_pct(fiche["irr_pct"]) if fiche["irr_pct"] == fiche["irr_pct"] and fiche["irr_pct"] is not None else "Non calculable"
+    if not fiche["rendement_brut_pct"]:
+        rendement_txt = "Non applicable"
+    elif fiche["rendement_brut_pct"] >= RENDEMENT_BRUT_PCT_MAX:
+        rendement_txt = f"> {_fmt_pct(RENDEMENT_BRUT_PCT_MAX)}"
+    else:
+        rendement_txt = _fmt_pct(fiche["rendement_brut_pct"])
+    # irr_pct est deja None (pas NaN) a ce stade -- compute_fiche() convertit
+    # le NaN eventuel de irr_from_cashflows() en None avant de le retourner.
+    if fiche["irr_pct"] is not None:
+        irr_txt = _fmt_pct(fiche["irr_pct"])
+    else:
+        irr_txt = {
+            "toujours_rentable": "Non calculable (rentabilite tres elevee)",
+            "jamais_rentable": "Non calculable (jamais rentable sur cet horizon)",
+        }.get(fiche.get("irr_failure_reason"), "Non calculable")
     t_synth = Table([
-        [f"Gain total ({NB_ANNEES} ans)", f"{fiche['gain_total_25ans_eur']:,.0f} EUR".replace(",", " ")],
+        [f"Gain total ({NB_ANNEES} ans)", _fmt_eur(fiche['gain_total_25ans_eur'])],
         ["Payback", payback_txt],
         ["Rendement brut", rendement_txt],
         ["Taux de rendement (IRR)", irr_txt],
@@ -372,7 +391,8 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
     header = ["Poste"] + [f"An {int(a)}" for a in df["annee"]]
     table_rows = [header]
     for label, col, fmt in row_defs:
-        table_rows.append([label] + [format(v, fmt).replace(",", " ") for v in df[col]])
+        decimals = int(fmt.split(".")[1].rstrip("f")) if "." in fmt else 0
+        table_rows.append([label] + [_fmt_number(v, decimals=decimals) for v in df[col]])
 
     n_year_cols = NB_ANNEES
     label_w = 3.6 * cm
