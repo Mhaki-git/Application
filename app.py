@@ -1181,10 +1181,21 @@ def _render_results(results):
                     _ecart_overrun = _dont_energie_an1 - total_apres
                     total_apres = float(_dont_energie_an1)
                     if abs(_ecart_overrun) > 1.0:
+                        # Explicite l'origine du surcout : le pic d'import residuel
+                        # (post PV+batterie, en kW instantane) compare a la puissance
+                        # souscrite -- c'est ce depassement, ponctuel ou recurrent, qui
+                        # declenche la penalite (OVERRUN_PENALTY_MULT dans le moteur).
+                        _pic_import_kw = float((serie_cout["import_kwh"] * 4.0).max())
+                        _depassement_kw = max(_pic_import_kw - contrat_kw, 0.0)
                         st.caption(
-                            f"⚠️ Le dispatch réel inclut {fmt_eur(_ecart_overrun)} de surcoût "
-                            "(dépassement de la puissance souscrite, pénalisé) non visible dans la "
-                            "répartition mensuelle ci-dessous ; le total « après PV » en tient compte."
+                            f"⚠️ Le dispatch réel inclut {fmt_eur(_ecart_overrun)} de surcoût que la "
+                            "répartition mensuelle ci-dessous ne montre pas. Origine : le pic d'import "
+                            f"réseau résiduel (post PV + batterie) atteint **{_pic_import_kw:.0f} kW** à "
+                            f"un moment de l'année, au-delà de la puissance souscrite "
+                            f"(**{contrat_kw:.0f} kW**, dépassement de **{_depassement_kw:.0f} kW**) -- "
+                            "ce dépassement est autorisé par le modèle mais facturé au triple du tarif "
+                            "réseau. Augmenter la puissance souscrite ou la puissance batterie/onduleur "
+                            "réduirait ce surcoût."
                         )
 
             _chart_title(f"Coût réseau du client · avant / après PV ({kwc:.0f} kWc)", "Année 1")
