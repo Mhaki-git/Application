@@ -11,10 +11,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from engine.fournisseur_roi import _align_market_price_to_calendar, demand_charge_rate_for_mode
+from engine.fournisseur_roi import (
+    _align_market_price_to_calendar,
+    demand_charge_rate_for_mode,
+    load_dayahead_prices,
+)
 from io_excel.dataextraction import (
     conso_from_normalized_profile,
     fill_missing_periods_by_calendar_symmetry,
+    read_dayahead_csv,
 )
 
 
@@ -98,6 +103,45 @@ def test_align_limited_slice_falls_back_to_nearest_available_day():
     expected = market_price[(market_price.index.month == 1) & (market_price.index.day == 1)
                              & (market_price.index.hour == 12)].mean()
     assert out.iloc[0] == pytest.approx(expected)
+
+
+def test_load_dayahead_prices_accepts_a_series_directly():
+    """
+    Upload utilisateur : app.py lit le CSV en pd.Series (read_dayahead_csv)
+    et la passe directement a load_dayahead_prices, SANS jamais l'ecrire sur
+    disque en .pkl (pd.read_pickle sur un fichier tiers serait une
+    deserialisation non fiable -- risque d'execution de code arbitraire).
+    Verifie que load_dayahead_prices accepte bien ce chemin (pas de crash sur
+    l'evaluation booleenne d'une Series, bug corrige dans la meme session).
+    """
+    idx_src = pd.date_range("2024-01-01", "2024-01-31 23:45", freq="15min")
+    market_price = pd.Series(np.full(len(idx_src), 0.08), index=idx_src)
+
+    target_index = pd.date_range("2025-01-15 12:00", periods=4, freq="15min")
+    prices, is_demo = load_dayahead_prices(market_price, target_index)
+
+    assert is_demo is False
+    assert (prices == 0.08).all()
+
+
+def test_read_dayahead_csv_then_load_dayahead_prices_end_to_end():
+    """Chemin complet upload CSV -> Series -> calage calendaire, comme app.py."""
+    import io
+
+    csv_text = "timestamp,prix_eur_kwh\n" + "\n".join(
+        f'{ts.strftime("%d/%m/%Y %H:%M")},{0.05 + 0.01 * (ts.hour % 4)}'
+        for ts in pd.date_range("2024-01-01", "2024-01-31 23:45", freq="15min")
+    )
+    buf = io.BytesIO(csv_text.encode("utf-8"))
+
+    series = read_dayahead_csv(buf)
+    assert isinstance(series, pd.Series)
+    assert len(series) > 0
+
+    target_index = pd.date_range("2025-01-15 12:00", periods=1, freq="15min")
+    prices, is_demo = load_dayahead_prices(series, target_index)
+    assert is_demo is False
+    assert prices.iloc[0] == pytest.approx(0.05 + 0.01 * (12 % 4))
 
 
 # ---------------------------------------------------------------------
