@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit / app runtime
+streamlit.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Excel lock files
+~$*.xls*
+
+# Source Excel template (large binary, kept locally / shared separately)
+/*.xlsm
+
+# Generated output artifacts
+fournisseur_roi_resultats.csv
+fournisseur_rapport_complet.txt
+
+# Test cache
+.pytest_cache/
+
+# Marker created by startup.bat after first successful dependency install
+.setup_ok
+
+# Claude Code local session state
+.claude/
