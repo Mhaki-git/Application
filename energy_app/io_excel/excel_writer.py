@@ -3,6 +3,11 @@ Ecrit les parametres saisis dans l'interface vers une COPIE du fichier Excel,
 dans les memes cellules que celles lues par dataextraction.py. Ne touche
 jamais aux donnees de consommation/PV (colonnes A-AC de DONNEES ENERGIE,
 onglet PVS) : uniquement le bloc de parametres.
+
+STATUT : orphelin fonctionnel -- aucun appelant dans app.py ni engine/ a ce
+jour (l'UI Streamlit actuelle ne relit/re-ecrit jamais le .xlsm). Conserve
+comme outil disponible pour un usage manuel/futur (regenerer une copie
+parametree du classeur source), pas comme partie active du pipeline.
 """
 import shutil
 import openpyxl
