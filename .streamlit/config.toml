@@ -20,3 +20,6 @@ toolbarMode = "minimal"
 
 [browser]
 gatherUsageStats = false
+
+[logger]
+hideWelcomeMessage = true
