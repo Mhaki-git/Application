@@ -72,8 +72,9 @@ archive -- il s'ouvre normalement dans Excel qui recalcule tout tout seul).
   - `dataextraction.py` -- lecture des donnees/parametres depuis l'Excel
   - `excel_writer.py` -- generation de la copie Excel "archive" (optionnelle)
   - `excel_schema.py` -- carte des cellules parametres, partagee par les deux fichiers ci-dessus
-- `io_sources/` -- sources de donnees externes (PV, prix de marche)
+- `io_sources/` -- sources de donnees externes (PV, conso, prix de marche)
   - `extract_pv_from_excel.py` -- fige le profil PV depuis l'Excel (script a executer une fois)
+  - `extract_conso_profiles_from_excel.py` -- fige les profils-types de consommation depuis l'Excel (script a executer une fois)
   - `fetch_belpex.py` -- recupere les prix Belpex Day-Ahead (script a executer une fois par annee)
   - `pv_pvgis.py` -- recuperation du profil PV via l'API PVGIS (alternative a l'Excel)
 - `reporting/` -- generation des rapports PDF

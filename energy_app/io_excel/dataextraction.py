@@ -319,6 +319,24 @@ def _find_first_timestamp_row(lines, sep: str, max_scan: int = 200) -> int:
     return 0
 
 
+def _parse_timestamp_column(col: pd.Series) -> pd.DatetimeIndex:
+    """
+    Parse une colonne de timestamps en gerant a la fois le format ISO 8601
+    (AAAA-MM-JJ, non ambigu) et la convention FR (JJ/MM/AAAA). Essaie
+    d'abord ISO8601 strict : si une seule valeur n'y correspond pas, bascule
+    sur dayfirst=True (JJ/MM/AAAA) pour toute la colonne.
+
+    Necessaire car pd.to_datetime(col, dayfirst=True) seul, applique a des
+    timestamps deja ISO (AAAA-MM-JJ), peut inferer le mauvais format a partir
+    des premieres lignes (AAAA-JJ-MM) et planter des qu'une ligne suivante a
+    un jour > 12 (ex: "2024-01-13" rejete car interprete comme "annee-jour-mois").
+    """
+    try:
+        return pd.to_datetime(col, format="ISO8601")
+    except (ValueError, TypeError):
+        return pd.to_datetime(col, dayfirst=True, format="mixed")
+
+
 def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
                     value_col: str = None, unit: str = "kW") -> pd.Series:
     """
@@ -351,7 +369,7 @@ def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
         candidates = ["conso", "consommation", "value", "valeur", "kw", "kwh", "power", "puissance"]
         value_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[1])
 
-    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)  # dayfirst=True : convention FR (JJ/MM/AAAA)
+    ts = _parse_timestamp_column(df[timestamp_col])
     values = df[value_col].apply(_parse_decimal_str)
     n_bad = int(values.isna().sum())
     if n_bad:
@@ -409,7 +427,7 @@ def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
         candidates = ["prix", "price", "value", "valeur", "eur_kwh", "eur/kwh", "prix_eur_kwh"]
         value_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[1])
 
-    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)  # dayfirst=True : convention FR (JJ/MM/AAAA)
+    ts = _parse_timestamp_column(df[timestamp_col])
     values = df[value_col].apply(_parse_decimal_str)
     n_bad = int(values.isna().sum())
     if n_bad:
