@@ -5,36 +5,27 @@ Interface web locale (Streamlit) pour ton moteur d'analyse "fournisseur"
 calcule (a partir de ton fichier Excel modele), et te sort un rapport PDF
 propre + les graphiques + le detail annee par annee.
 
-## Installation et lancement (aucune connaissance technique requise)
+## Installation et lancement
 
-Pas besoin d'ouvrir un terminal ni de taper la moindre commande : deux
-etapes, uniquement a la souris.
+**Etape 1 -- Installer Python (une seule fois)**
 
-**Etape 1 -- Installer Python (une seule fois, quelques minutes)**
-
-1. Va sur https://www.python.org/downloads/ et clique sur le gros bouton
-   jaune "Download Python".
+1. Va sur https://www.python.org/downloads/ et clique sur "Download Python".
 2. Lance le fichier telecharge.
-3. **Important** : sur le premier ecran de l'installateur, coche la case
-   *"Add python.exe to PATH"* (en bas de la fenetre) avant de cliquer sur
-   "Install Now". Si tu oublies cette case, relance simplement
-   l'installateur et recommence.
+3. Sur le premier ecran de l'installateur, coche la case *"Add python.exe
+   to PATH"* avant de cliquer sur "Install Now".
 
 **Etape 2 -- Lancer l'appli**
 
 Double-clique sur `startup.bat` (dans ce dossier).
 
-- La toute premiere fois, une fenetre noire s'ouvre et installe tout ce
-  dont l'appli a besoin -- ca prend quelques minutes et c'est normal,
-  laisse-la travailler sans la fermer.
-- Une fois l'installation terminee (et a chaque lancement suivant, qui
-  sera quasi instantane), une page s'ouvre automatiquement dans ton
-  navigateur avec l'appli prete a l'emploi.
-- Pour arreter l'appli : ferme simplement la fenetre noire.
+- La toute premiere fois, une fenetre noire s'ouvre et installe les
+  dependances -- ca prend quelques minutes, laisse-la travailler.
+- Ensuite (et a chaque lancement suivant), une page s'ouvre
+  automatiquement dans ton navigateur avec l'appli.
+- Pour arreter l'appli : ferme la fenetre noire.
 
-Si une fenetre affiche un message d'erreur (par exemple "Python n'est pas
-installe"), relis l'etape 1 -- c'est presque toujours la case "Add to PATH"
-qui a ete oubliee.
+Si une fenetre affiche "Python n'est pas installe", verifie que la case
+"Add to PATH" a bien ete cochee a l'etape 1, puis relance.
 
 ## Partager l'appli avec des collegues (meme reseau / bureau)
 
