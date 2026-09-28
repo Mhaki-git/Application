@@ -629,7 +629,7 @@ if submitted:
 
         if dayahead_path is None:  # belpex_source == "auto"
             annees_client = sorted(set(df.index.year.tolist()))
-            annee_choisie = next((a for a in annees_client if str(a) in _belpex_annees_dispo),
+            annee_choisie = next((str(a) for a in annees_client if str(a) in _belpex_annees_dispo),
                                   max(_belpex_annees_dispo))
             dayahead_path = os.path.join(BELPEX_DATA_DIR, f"belpex_{annee_choisie}_qh.pkl")
             st.caption(
