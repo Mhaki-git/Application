@@ -225,6 +225,16 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
     ]))
     story.append(t4)
 
+    if decomp["gain_pv_eur"] < 0 or decomp["gain_batterie_belpex_eur"] < 0:
+        story.append(Spacer(1, 0.3 * cm))
+        story.append(Paragraph(
+            "ATTENTION : un gain decompose ci-dessus est negatif -- cas limite du dispatch "
+            "(le tarif capacitaire ou une contrainte de contrat peut rendre l'ajout de PV/batterie "
+            "ponctuellement defavorable dans cette decomposition). Le graphique plafonne a 0 pour "
+            "rester lisible. Verifier le gain total et les hypotheses (contrat souscrit, tarif "
+            "capacitaire) avant d'envoyer ce rapport a un client.",
+            ParagraphStyle("Warn2", parent=body, textColor=colors.red)))
+
     story.append(PageBreak())
 
     # --- Detail annuel (tableau complet) ---
