@@ -27,19 +27,26 @@ def simulate_battery_selfconso(pv_kwh: np.ndarray, conso_kwh: np.ndarray,
     (dans la limite de sa puissance et de sa capacite), le deficit est couvert
     par la batterie si elle a de l'energie disponible.
     """
+    # Energie maximale echangeable avec la batterie sur UN pas de temps (kWh),
+    # convertie depuis la puissance nominale (kW) via DT_HOURS = 0.25 h.
     p_max_kwh = battery_power_kw * DT_HOURS
-    soc = 0.0
+    soc = 0.0  # etat de charge courant de la batterie, en kWh (0 au demarrage)
     n = len(pv_kwh)
     import_kwh = np.empty(n)
     export_kwh = np.empty(n)
     for i in range(n):
         surplus = pv_kwh[i] - conso_kwh[i]
         if surplus >= 0:
+            # Production excedentaire : on charge la batterie en priorite,
+            # dans la limite de sa puissance et de la place disponible ;
+            # le reste (si la batterie est pleine ou trop lente) part au reseau.
             charge = min(surplus, p_max_kwh, battery_capacity_kwh - soc)
             soc += charge
             export_kwh[i] = surplus - charge
             import_kwh[i] = 0.0
         else:
+            # Consommation superieure a la production : la batterie comble le
+            # deficit si elle a de l'energie stockee, le reste vient du reseau.
             deficit = -surplus
             decharge = min(deficit, p_max_kwh, soc)
             soc -= decharge

@@ -63,6 +63,12 @@ _LOG_ROUTER_LOCK = threading.Lock()
 
 
 def _install_thread_log_router() -> "_ThreadLogRouter":
+    """
+    Installe (une seule fois, de facon idempotente et thread-safe) le
+    _ThreadLogRouter a la place de sys.stdout, et retourne l'instance
+    installee (nouvelle ou deja existante) pour que l'appelant puisse y
+    attacher son propre fichier de log par thread.
+    """
     with _LOG_ROUTER_LOCK:
         if not isinstance(sys.stdout, _ThreadLogRouter):
             sys.stdout = _ThreadLogRouter(sys.stdout)
@@ -72,17 +78,20 @@ def _install_thread_log_router() -> "_ThreadLogRouter":
 XLSM_PATH = DEFAULT_XLSM_PATH
 DAYAHEAD_PKL_PATH = "dayahead_prices_2024_qh.pkl"
 
+# Rendements aller (charge) et retour (decharge) de la batterie (sans unite,
+# fraction de 1) : la moitie des pertes de conversion est imputee a chaque
+# sens, ce qui donne un rendement aller-retour global de ETA_C * ETA_D = 90%.
 ETA_C = 0.95
 ETA_D = 0.95
-SOC_INIT_RATIO = 0.5
-DT = 0.25
-STEPS_PER_DAY = 96
+SOC_INIT_RATIO = 0.5  # SOC de depart de chaque annee simulee, en fraction de e_max (pas d'etat reporte d'une annee sur l'autre).
+DT = 0.25  # Duree d'un pas de temps, en heures (quart d'heure) -- sert a convertir puissance (kW) <-> energie (kWh) sur un pas.
+STEPS_PER_DAY = 96  # 24h / DT : nombre de pas de temps quart-horaires dans une journee.
 
 HORIZON_ANNEES = 20
-APPLIQUER_INFLATION_AU_PRIX_MARCHE = False
+APPLIQUER_INFLATION_AU_PRIX_MARCHE = False  # Si False, seuls marge/taxes/injection sont indexes sur l'inflation annee apres annee -- le prix de marche Day-Ahead lui-meme reste celui de l'annee source (hypothese : le marche de gros n'est pas suppose suivre l'inflation domestique).
 
-OVERRUN_PENALTY_MULT = 3.0
-DISCOUNT_RATE_DEFAULT = 0.06
+OVERRUN_PENALTY_MULT = 3.0  # Multiplicateur de penalite (x price_import) applique a tout depassement du contrat_kw souscrit -- assez eleve pour que le LP/l'heuristique n'y recourent qu'en dernier recours, jamais par arbitrage economique.
+DISCOUNT_RATE_DEFAULT = 0.06  # Taux d'actualisation par defaut (6%/an) utilise pour le calcul de la VAN (compute_npv_irr).
 
 
 def _build_lp_skeleton(n: int):
@@ -99,12 +108,18 @@ def _build_lp_skeleton(n: int):
     _dispatch_no_battery et solve_day_dispatch_heuristic geraient deja ce
     cas en douceur avec la meme penalite -- incoherence corrigee ici.
     """
-    i_n = sparse.eye(n, format="csr")
-    z_n = sparse.csr_matrix((n, n))
-    s_n = sparse.eye(n, k=-1, format="csr")
+    i_n = sparse.eye(n, format="csr")  # matrice identite n x n : coefficient 1 sur chaque pas de temps pris isolement.
+    z_n = sparse.csr_matrix((n, n))  # bloc nul n x n, pour les variables qui n'interviennent pas dans une contrainte donnee.
+    s_n = sparse.eye(n, k=-1, format="csr")  # identite decalee d'une sous-diagonale : s_n @ soc = soc au pas de temps precedent (t-1), utilise pour la contrainte de continuite du SOC.
     zeros_col = sparse.csr_matrix((n, 1))
     ones_col = sparse.csr_matrix(np.ones((n, 1)))
 
+    # Contrainte de bilan energetique a chaque pas de temps (egalite, voir A_eq
+    # dans _lp_equality_matrix) : decharge + imp + imp_overrun - charge - exp -
+    # curtail = conso - pv. Autrement dit toute l'energie qui entre dans le
+    # noeud (batterie qui se decharge, import reseau normal + en depassement)
+    # doit egaler ce qui en sort (charge batterie, export, ecretement) plus le
+    # desequilibre net conso-pv de ce pas de temps.
     a_balance = sparse.hstack([-i_n, i_n, i_n, -i_n, z_n, -i_n, i_n, zeros_col], format="csr")
     # imp_overrun contribue AUSSI au pic de puissance facturable (tarif
     # capacitaire) : c'est de la puissance reellement soutiree du reseau a
@@ -113,6 +128,11 @@ def _build_lp_skeleton(n: int):
     # imp_overrun (penalise mais fixe) plutot que imp (dans la limite du
     # contrat) simplement pour echapper au tarif capacitaire sur le pic,
     # ce qui n'a pas de sens physique.
+    # Contrainte d'inegalite (imp + imp_overrun) * DT - new_peak <= 0 a chaque
+    # pas de temps : force new_peak (variable scalaire, kW) a etre au moins
+    # egale a la puissance importee (normale + en depassement) sur CHAQUE pas
+    # de temps du mois -- new_peak represente donc le pic de puissance
+    # facturable du mois une fois le LP resolu (voir usage de c[7*N] plus bas).
     a_peak = sparse.hstack([z_n, z_n, i_n, z_n, z_n, z_n, i_n, -DT * ones_col], format="csr")
 
     return {
@@ -132,11 +152,25 @@ _A_EQ_CACHE = {}
 
 
 def _lp_equality_matrix(n: int, eta_c: float, eta_d: float):
+    """
+    Construit (ou recupere depuis le cache _A_EQ_CACHE) la matrice d'egalite
+    complete du LP journalier : bilan energetique (A_balance) empile avec la
+    contrainte de continuite du SOC (a_soc). Mise en cache par (n, eta_c,
+    eta_d) car ces matrices sont purement structurelles -- independantes des
+    donnees du jour (conso, pv, prix) -- et couteuses a reconstruire a chaque
+    appel.
+    """
     key = (n, eta_c, eta_d)
     a_eq = _A_EQ_CACHE.get(key)
     if a_eq is None:
         sk = _LP_SKELETON if n == STEPS_PER_DAY else _build_lp_skeleton(n)
         i_n, z_n, s_n = sk["I_N"], sk["Z_N"], sk["S_N"]
+        # Continuite du SOC : soc[t] - soc[t-1] = eta_c*charge[t] - decharge[t]/eta_d
+        # (soc[t-1] = 0 pour t=0, la valeur initiale reelle soc_init est injectee
+        # via b_soc[0] dans le second membre, pas dans cette matrice). Les pertes
+        # de conversion sont donc integrees ici : eta_c < 1 fait que charger 1 kWh
+        # au reseau n'ajoute que eta_c kWh au SOC, et eta_d < 1 fait qu'il faut
+        # puiser 1/eta_d kWh du SOC pour restituer 1 kWh en sortie.
         a_soc = sparse.hstack([-eta_c * i_n, (1 / eta_d) * i_n, z_n, z_n,
                                i_n - s_n, z_n, z_n, sk["zeros_col"]], format="csr")
         a_eq = sparse.vstack([sk["A_balance"], a_soc], format="csr")
@@ -145,6 +179,7 @@ def _lp_equality_matrix(n: int, eta_c: float, eta_d: float):
 
 
 def _dispatch_to_frame(arrays: dict) -> pd.DataFrame:
+    """Convertit le dict de tableaux numpy issu d'un dispatch journalier en DataFrame (colonnes DISPATCH_COLUMNS)."""
     return pd.DataFrame({col: arrays[col] for col in DISPATCH_COLUMNS})
 
 
@@ -260,6 +295,17 @@ def load_dayahead_prices(dayahead_pkl_path, target_index: pd.DatetimeIndex) -> t
 
 
 def build_tariff_fournisseur(market_price_values: np.ndarray, params: dict, inflate_market: bool = False):
+    """
+    Construit price_import/price_export (en EUR/kWh, meme resolution
+    temporelle que market_price_values) pour le mode "fournisseur_principal" :
+    le client achete au prix de marche Day-Ahead + marge fournisseur + taxes
+    et couts proportionnels, et est rembourse sur son export au prix de
+    marche + marge d'injection (potentiellement negative), plafonne a 0 pour
+    ne jamais payer le client a exporter (pas de prix d'injection negatif
+    facture au client). Le parametre inflate_market n'est pas utilise ici
+    (l'indexation eventuelle du prix de marche sur l'inflation est geree
+    separement, voir APPLIQUER_INFLATION_AU_PRIX_MARCHE dans _dispatch_one_year).
+    """
     marge_f = params["marge_fournisseur"]
     taxes = params["taxes_couts_proportionnels"]
     marge_inj = params["marge_injection"]
@@ -294,6 +340,7 @@ def build_tariff_reference(params: dict, hour_all: np.ndarray):
 
 def _dispatch_no_battery(conso, pv, price_import, price_export,
                           contrat_kw, peak_so_far_kw, dt=DT):
+    """Variante DataFrame de _dispatch_no_battery_arrays (voir cette derniere pour le detail) -- meme contrat de retour (frame, soc, new_peak, day_cost) que solve_day_dispatch."""
     arrays, soc, new_peak, day_cost = _dispatch_no_battery_arrays(
         conso, pv, price_import, price_export, contrat_kw, peak_so_far_kw, dt=dt)
     return _dispatch_to_frame(arrays), soc, new_peak, day_cost
@@ -307,18 +354,18 @@ def _dispatch_no_battery_arrays(conso, pv, price_import, price_export,
     au contrat, depassement penalise (OVERRUN_PENALTY_MULT).
     """
     N = len(conso)
-    net = conso - pv
+    net = conso - pv  # net > 0 : deficit a importer ; net < 0 : surplus PV a exporter (kWh sur le pas de temps).
     imp_uncapped = np.maximum(net, 0)
     exp_uncapped = np.maximum(-net, 0)
 
-    imp = np.minimum(imp_uncapped, contrat_kw * dt)
-    imp_overrun = imp_uncapped - imp
-    exp = np.minimum(exp_uncapped, contrat_kw * dt)
-    curtail = exp_uncapped - exp
+    imp = np.minimum(imp_uncapped, contrat_kw * dt)  # import plafonne a la puissance souscrite (contrat_kw en kW -> kWh via *dt).
+    imp_overrun = imp_uncapped - imp  # depassement du contrat, autorise mais penalise ci-dessous (jamais bloquant).
+    exp = np.minimum(exp_uncapped, contrat_kw * dt)  # export egalement plafonne au contrat (limite d'injection au reseau).
+    curtail = exp_uncapped - exp  # surplus PV non exportable (au-dela du contrat) : perdu, ni facture ni credite.
 
     overrun_cost = (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum()
     day_cost = float((imp * price_import - exp * price_export).sum() + overrun_cost)
-    new_peak = max(peak_so_far_kw, (imp / dt).max() if N else 0.0)
+    new_peak = max(peak_so_far_kw, (imp / dt).max() if N else 0.0)  # met a jour le pic mensuel de puissance importee (kW) ; ignore volontairement imp_overrun (voir a_peak plus haut pour le cas LP, qui lui l'inclut).
     zeros = np.zeros(N)
     arrays = {
         "charge_kwh": zeros, "decharge_kwh": zeros,
@@ -332,6 +379,12 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
                         p_max, e_max, contrat_kw,
                         soc_init, peak_so_far_kw, demand_charge_rate,
                         eta_c=ETA_C, eta_d=ETA_D, dt=DT):
+    """
+    Dispatch journalier OPTIMAL (LP, arbitrage sur les prix) : voir
+    _solve_day_lp_arrays pour le detail du probleme d'optimisation. Variante
+    DataFrame de cette derniere -- meme contrat de retour partout dans ce
+    module : (frame/tableaux, soc final, nouveau pic mensuel kW, cout du jour EUR).
+    """
     arrays, soc, new_peak, day_cost = _solve_day_lp_arrays(
         conso, pv, price_import, price_export, p_max, e_max, contrat_kw,
         soc_init, peak_so_far_kw, demand_charge_rate, eta_c=eta_c, eta_d=eta_d, dt=dt)
@@ -342,12 +395,25 @@ def _solve_day_lp_arrays(conso, pv, price_import, price_export,
                          p_max, e_max, contrat_kw,
                          soc_init, peak_so_far_kw, demand_charge_rate,
                          eta_c=ETA_C, eta_d=ETA_D, dt=DT):
+    """
+    Resout le LP journalier qui minimise le cout d'energie (import - export,
+    en EUR) plus la penalite de depassement de contrat et le tarif
+    capacitaire sur le pic de puissance, en choisissant l'usage optimal de la
+    batterie (arbitrage sur price_import/price_export). conso et pv sont en
+    kWh par pas de temps (longueur N, generalement 96 = un jour). Retourne
+    (dict de tableaux numpy par variable de dispatch, SOC final en kWh,
+    nouveau pic mensuel en kW, cout du jour en EUR). Leve RuntimeError si le
+    solveur ne converge pas (voir _lp_not_converged) et ValueError si
+    contrat_kw est nul/absent.
+    """
     N = len(conso)
 
     if contrat_kw <= 0:
         raise ValueError("contrat_kw (Excel N16) est nul ou absent.")
 
     if e_max <= 0 or p_max <= 0:
+        # Pas de batterie utilisable : repli sur le meme calcul simplifie que
+        # l'heuristique, pour rester coherent avec _solve_day_heuristic_arrays.
         return _dispatch_no_battery_arrays(conso, pv, price_import, price_export,
                                             contrat_kw, peak_so_far_kw, dt=dt)
 
@@ -355,7 +421,7 @@ def _solve_day_lp_arrays(conso, pv, price_import, price_export,
 
     b_balance = conso - pv
     b_soc = np.zeros(N)
-    b_soc[0] = soc_init
+    b_soc[0] = soc_init  # seul le premier pas de temps recoit le SOC de depart ; les suivants sont enchaines par la contrainte de continuite (a_soc).
 
     A_eq = _lp_equality_matrix(N, eta_c, eta_d)
     b_eq = np.concatenate([b_balance, b_soc])
@@ -363,8 +429,15 @@ def _solve_day_lp_arrays(conso, pv, price_import, price_export,
     A_peak = sk["A_peak"]
     b_peak = np.zeros(N)
 
-    curtail_upper = np.maximum(pv, 0.0)
+    curtail_upper = np.maximum(pv, 0.0)  # on ne peut jamais ecreter plus que ce que le PV produit a cet instant.
 
+    # Vecteur de couts (fonction objectif) du LP, une entree par variable de
+    # decision (7*N variables par pas de temps + new_peak scalaire) : charge et
+    # decharge n'ont pas de cout direct (seul le bilan les contraint), imp
+    # coute price_import, exp RAPPORTE price_export (d'ou le signe -), curtail
+    # est gratuit, imp_overrun coute price_import * OVERRUN_PENALTY_MULT (fort
+    # dissuasif), et new_peak coute demand_charge_rate (EUR/kW) -- c'est le
+    # terme qui incite le LP a ecreter les pics de puissance mensuels.
     c = np.zeros(7 * N + 1)
     c[2 * N:3 * N] = price_import
     c[3 * N:4 * N] = -price_export
@@ -378,6 +451,8 @@ def _solve_day_lp_arrays(conso, pv, price_import, price_export,
         x = _solve_lp_scipy(c, A_peak, b_peak, A_eq, b_eq, N, p_max, e_max, contrat_kw,
                             curtail_upper, peak_so_far_kw, dt)
 
+    # Decoupage du vecteur solution x selon l'ordre etabli dans _build_lp_skeleton :
+    # charge, decharge, imp, exp, soc, curtail, imp_overrun, new_peak (scalaire final).
     charge, decharge = x[0:N], x[N:2 * N]
     imp, exp, soc = x[2 * N:3 * N], x[3 * N:4 * N], x[4 * N:5 * N]
     curtail = x[5 * N:6 * N]
@@ -394,6 +469,7 @@ def _solve_day_lp_arrays(conso, pv, price_import, price_export,
 
 
 def _lp_not_converged(message, contrat_kw, p_max, e_max):
+    """Construit l'exception RuntimeError levee quand le LP journalier (scipy ou HiGHS) ne trouve pas de solution optimale, avec un message pointant vers les parametres les plus probablement en cause."""
     return RuntimeError(
         f"LP journalier n'a pas converge : {message}. "
         f"Verifie contrat_kw ({contrat_kw} kW), battery_power_kw ({p_max} kW) et "
@@ -429,6 +505,16 @@ _HIGHS_LOCAL = threading.local()
 
 
 def _highs_day_model(n: int, eta_c: float, eta_d: float):
+    """
+    Recupere (en le creant au besoin) le modele HiGHS mis en cache pour ce
+    thread et cette clef (n, eta_c, eta_d) : la structure du LP (matrice de
+    contraintes, nombre de lignes/colonnes) est figee une fois pour toutes,
+    seuls couts/bornes/second membre changeront a chaque appel de
+    _solve_lp_highspy (voir h.changeCols*/changeRowsBounds). Le cache est
+    stocke dans un threading.local() (_HIGHS_LOCAL) : un objet Highs n'est pas
+    partageable entre threads, et Streamlit execute chaque session utilisateur
+    dans son propre thread.
+    """
     models = getattr(_HIGHS_LOCAL, "models", None)
     if models is None:
         models = _HIGHS_LOCAL.models = {}
@@ -442,6 +528,9 @@ def _highs_day_model(n: int, eta_c: float, eta_d: float):
         lp = highspy.HighsLp()
         lp.num_col_ = n_col
         lp.num_row_ = n_row
+        # Couts/bornes initialises a zero ici : ce sont des valeurs de
+        # placeholder, ecrasees a chaque jour par _solve_lp_highspy via
+        # changeColsCost/changeColsBounds/changeRowsBounds avant chaque run().
         lp.col_cost_ = np.zeros(n_col)
         lp.col_lower_ = np.zeros(n_col)
         lp.col_upper_ = np.zeros(n_col)
@@ -461,11 +550,22 @@ def _highs_day_model(n: int, eta_c: float, eta_d: float):
 
 def _solve_lp_highspy(N, eta_c, eta_d, c, b_eq, p_max, e_max, contrat_kw,
                       curtail_upper, peak_so_far_kw, dt):
+    """
+    Resout le meme LP journalier que _solve_lp_scipy mais via l'API bas
+    niveau de highspy directement sur le modele mis en cache (_highs_day_model),
+    en ne reenvoyant que ce qui change d'un jour a l'autre (couts, bornes,
+    second membre) -- evite la couche de validation/reconstruction de
+    scipy.optimize.linprog, qui dominait le temps de calcul (~2x plus rapide).
+    """
     h, col_idx, row_idx = _highs_day_model(N, eta_c, eta_d)
     inf = highspy.kHighsInf
 
+    # Bornes des variables (colonnes), dans l'ordre du skeleton : charge et
+    # decharge <= p_max*dt (puissance batterie max sur un pas), imp et exp
+    # <= contrat_kw*dt (puissance souscrite max sur un pas), soc <= e_max
+    # (capacite batterie en kWh), curtail <= pv du pas (curtail_upper).
     col_lower = np.zeros(7 * N + 1)
-    col_lower[7 * N] = peak_so_far_kw
+    col_lower[7 * N] = peak_so_far_kw  # new_peak ne peut jamais redescendre sous le pic deja atteint plus tot dans le mois.
     col_upper = np.empty(7 * N + 1)
     col_upper[0:2 * N] = p_max * dt
     col_upper[2 * N:4 * N] = contrat_kw * dt
@@ -473,6 +573,9 @@ def _solve_lp_highspy(N, eta_c, eta_d, c, b_eq, p_max, e_max, contrat_kw,
     col_upper[5 * N:6 * N] = curtail_upper
     col_upper[6 * N:] = inf  # imp_overrun (non borne mais penalise) et new_peak
 
+    # Bornes des lignes de contraintes : les N premieres (A_peak) sont des
+    # inegalites <= 0 (borne inf -infini), les suivantes (A_eq, bilan + SOC)
+    # sont des egalites strictes bornees des deux cotes par b_eq.
     row_lower = np.concatenate([np.full(N, -inf), b_eq])
     row_upper = np.concatenate([np.zeros(N), b_eq])
 
@@ -495,6 +598,11 @@ def solve_day_dispatch_heuristic(conso, pv, price_import, price_export,
                                   p_max, e_max, contrat_kw,
                                   soc_init, peak_so_far_kw, demand_charge_rate,
                                   eta_c=ETA_C, eta_d=ETA_D, dt=DT):
+    """
+    Dispatch journalier HEURISTIQUE (self-consumption, sans arbitrage prix) :
+    voir _solve_day_heuristic_arrays pour le detail. Variante DataFrame de
+    cette derniere -- meme contrat de retour que solve_day_dispatch.
+    """
     arrays, soc, new_peak, day_cost = _solve_day_heuristic_arrays(
         conso, pv, price_import, price_export, p_max, e_max, contrat_kw,
         soc_init, peak_so_far_kw, demand_charge_rate, eta_c=eta_c, eta_d=eta_d, dt=dt)
@@ -549,25 +657,34 @@ def _solve_day_heuristic_arrays(conso, pv, price_import, price_export,
         net = pv[t] - conso[t]  # > 0 : surplus PV disponible ; < 0 : deficit a couvrir
 
         if net > 0:
+            # room_kwh : place encore dispo dans la batterie, exprimee en kWh
+            # PRELEVES AU RESEAU/PV (pas en kWh stockes) -- on divise par eta_c
+            # car charger room_kwh*eta_c kWh dans la batterie en necessite
+            # room_kwh en entree (pertes de conversion a la charge).
             room_kwh = max(e_max - soc, 0.0) / eta_c
-            c = min(net, p_step, room_kwh)
+            c = min(net, p_step, room_kwh)  # charge limitee par le surplus dispo, la puissance max batterie (p_step) et la place restante.
             charge[t] = c
-            soc += c * eta_c
+            soc += c * eta_c  # seule une fraction eta_c de l'energie prelevee est effectivement stockee.
             remaining = net - c
             e = min(remaining, export_cap)
             exp[t] = e
-            curtail[t] = remaining - e
+            curtail[t] = remaining - e  # surplus non charge ni exportable (au-dela du contrat) : perdu.
         elif net < 0:
             deficit = -net
-            available_kwh = soc * eta_d
-            d = min(deficit, p_step, available_kwh)
+            available_kwh = soc * eta_d  # energie restituable au reseau/conso depuis le SOC actuel, compte tenu des pertes de decharge.
+            d = min(deficit, p_step, available_kwh)  # decharge limitee par le deficit a couvrir, la puissance max batterie et l'energie dispo.
             decharge[t] = d
-            soc -= d / eta_d
+            soc -= d / eta_d  # il faut puiser d/eta_d kWh de SOC pour restituer d kWh en sortie (pertes de conversion a la decharge).
             imp[t] = min(deficit - d, import_cap)
             # au-dela de import_cap : depassement contrat, penalise ci-dessous
 
         soc_arr[t] = soc
 
+    # imp_overrun recalcule a posteriori (et non au fil de la boucle) : c'est
+    # le manque total (deficit_all) moins ce que la batterie a couvert
+    # (decharge) moins la limite contractuelle -- equivalent a la logique
+    # "au-dela de import_cap" ci-dessus, mais reformule vectoriellement une
+    # fois la boucle terminee plutot que de dupliquer le calcul a chaque pas.
     deficit_all = np.maximum(-(pv - conso), 0.0)
     imp_overrun = np.maximum(deficit_all - decharge - import_cap, 0.0)
     overrun_cost = (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum()
@@ -586,6 +703,21 @@ def _solve_day_heuristic_arrays(conso, pv, price_import, price_export,
 def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
                        p_max, e_max, contrat_kw, demand_charge_rate,
                        index, return_detail=False, dispatch_fn=solve_day_dispatch):
+    """
+    Enchaine le dispatch jour par jour (via dispatch_fn, LP ou heuristique)
+    sur toute la periode couverte par conso_all/pv_all (tableaux en kWh par
+    pas de temps quart-horaire, longueur multiple de STEPS_PER_DAY -- les
+    eventuels pas restants en fin de periode sont ignores, cf. n_days).
+    Le SOC est reporte d'un jour sur l'autre (soc_init du jour suivant = soc
+    final du jour precedent), mais reinitialise a e_max * SOC_INIT_RATIO en
+    tout debut d'appel -- chaque appel demarre donc une "annee" fraiche.
+    Le pic de puissance (peak_so_far_kw) est en revanche remis a zero a
+    chaque changement de mois calendaire (voir month_peaks), pour calculer un
+    tarif capacitaire mensuel independant d'un mois a l'autre.
+    Retourne (cout energie EUR, cout capacitaire total EUR, import total kWh,
+    export total kWh, ecretement total kWh), et en plus un DataFrame detaille
+    quart-horaire si return_detail=True.
+    """
     n_days = len(conso_all) // STEPS_PER_DAY
     soc = e_max * SOC_INIT_RATIO
     current_month, peak_so_far = None, 0.0
@@ -607,6 +739,9 @@ def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
         sl = slice(d * STEPS_PER_DAY, (d + 1) * STEPS_PER_DAY)
         month = months[d * STEPS_PER_DAY]
         if month != current_month:
+            # Nouveau mois calendaire : on fige le pic du mois qui vient de se
+            # terminer (utilise plus bas pour calculer demand_charge_total) et
+            # on repart de zero pour le pic du nouveau mois.
             if current_month is not None:
                 month_peaks[current_month] = peak_so_far
             current_month = month
@@ -621,7 +756,7 @@ def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
         else:
             day_df, soc, new_peak, day_cost = dispatch_fn(*day_args, **day_kwargs)
             day = {col: day_df[col].to_numpy() for col in DISPATCH_COLUMNS}
-        peak_so_far = new_peak
+        peak_so_far = new_peak  # SOC (via soc_init ci-dessus) ET pic de puissance sont reportes au jour suivant.
         total_energy_cost += day_cost
         total_export += float(day["export_kwh"].sum())
         total_import += float(day["import_kwh"].sum())
@@ -630,8 +765,8 @@ def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
         if return_detail:
             day_arrays.append(day)
 
-    month_peaks[current_month] = peak_so_far
-    demand_charge_total = demand_charge_rate * sum(month_peaks.values())
+    month_peaks[current_month] = peak_so_far  # fige aussi le pic du tout dernier mois (jamais ferme par la boucle ci-dessus).
+    demand_charge_total = demand_charge_rate * sum(month_peaks.values())  # EUR/kW * somme des pics mensuels (kW) = cout capacitaire annuel total.
 
     if return_detail:
         n_pts = n_days * STEPS_PER_DAY
@@ -654,6 +789,21 @@ _ARRAY_DISPATCH_IMPLS = {
 def decompose_gains(conso_all, pv_all, price_import_all, price_export_all,
                      p_max, e_max, contrat_kw, demand_charge_rate, index,
                      scenario_c_precomputed=None, dispatch_fn=solve_day_dispatch):
+    """
+    Decompose le gain total (annee 1) en deux contributions distinctes, en
+    comparant trois scenarios contrefactuels sur la meme periode :
+      - A : "tout reseau" -- ni PV ni batterie (pv force a 0, p_max=e_max=0).
+      - B : "PV seul" -- PV branche mais pas de batterie (p_max=e_max=0).
+      - C : "PV + batterie" -- systeme complet (le scenario reel).
+    gain_pv = A - B isole l'effet du PV seul (autoconsommation directe,
+    sans stockage), gain_batterie = B - C isole l'effet ADDITIONNEL de la
+    batterie (arbitrage/ecretement par-dessus le PV). Cette decomposition
+    permet d'afficher separement au client la part de son economie due au PV
+    et celle due a la batterie. scenario_c_precomputed permet de reutiliser
+    un dispatch complet (cout, import, export) deja calcule par ailleurs pour
+    le scenario C, au lieu de refaire les 365 jours de LP/heuristique une
+    deuxieme fois pour rien.
+    """
     cost_A_energy, cost_A_peak, imp_A, exp_A, curt_A = run_year_dispatch(
         conso_all, np.zeros_like(pv_all), price_import_all, price_export_all,
         p_max=0, e_max=0, contrat_kw=contrat_kw,
@@ -698,18 +848,30 @@ def decompose_gains(conso_all, pv_all, price_import_all, price_export_all,
 def print_energy_report(conso_all, pv_all, p_max, e_max, contrat_kw, demand_charge_rate,
                          index, detail_precompute=None,
                          total_import=None, total_export=None, total_curtail=None):
+    """
+    Affiche (print) et retourne un bilan energetique synthetique de l'annee 1
+    (kWh produits/importes/exportes, cycles batterie equivalents, prix moyens
+    reellement payes/recus). detail_precompute est le DataFrame quart-horaire
+    deja calcule par run_year_dispatch(..., return_detail=True) : cette
+    fonction ne relance aucun dispatch, elle ne fait qu'agreger des colonnes
+    deja produites ailleurs.
+    """
     detail = detail_precompute
 
     pv_total = float(pv_all.sum())
     conso_total = float(conso_all.sum())
-    part_non_importee = conso_total - total_import
-    pv_exporte = pv_total - part_non_importee
+    part_non_importee = conso_total - total_import  # consommation couverte par PV et/ou batterie plutot qu'importee du reseau.
+    pv_exporte = pv_total - part_non_importee  # approximation : suppose que toute la conso non-importee vient du PV direct (ignore les cycles de charge/decharge batterie, negligeables sur un bilan annuel).
 
     charge_total = float(detail["charge_kwh"].sum())
     decharge_total = float(detail["decharge_kwh"].sum())
-    cycles_equivalents = decharge_total / e_max if e_max > 0 else 0.0
+    cycles_equivalents = decharge_total / e_max if e_max > 0 else 0.0  # 1 cycle equivalent = decharger l'equivalent de la pleine capacite une fois, utile pour estimer l'usure/duree de vie batterie.
 
     if e_max > 0:
+        # Fraction du temps ou la batterie est (quasi) pleine/vide (seuils a
+        # 98%/2% pour absorber le bruit numerique du LP) : indicateur de
+        # dimensionnement (batterie trop petite si souvent pleine, trop
+        # grande si souvent vide).
         pct_temps_pleine = 100 * (detail["soc_kwh"] >= 0.98 * e_max).mean()
         pct_temps_vide = 100 * (detail["soc_kwh"] <= 0.02 * e_max).mean()
     else:
@@ -744,6 +906,16 @@ def print_energy_report(conso_all, pv_all, p_max, e_max, contrat_kw, demand_char
 
 def client_old_cost(conso_all: np.ndarray, hour_all: np.ndarray, params: dict,
                      index: pd.DatetimeIndex = None) -> float:
+    """
+    Calcule ce que le client payait AVANT le systeme PV+batterie (annee 1),
+    sur la base de sa consommation totale (conso_all, en kWh par pas de
+    temps) et de son ancien tarif reseau : soit fixe (old_price_kwh_fixe),
+    soit HP/HC (price_hp/price_hc selon hour_all et les heures de bascule),
+    plus les frais fixes de contrat et, si applicable, le tarif capacitaire
+    sur son pic de puissance mensuel non mitige (voir commentaire ci-dessous).
+    Retourne un montant en EUR/an. N'est jamais appele en mode
+    "fournisseur_secondaire" (voir _run_fournisseur_model_impl).
+    """
     if params["price_hp"] or params["price_hc"]:
         is_hp = (hour_all >= params["heure_debut_hp"]) & (hour_all < params["heure_debut_hc"])
         price = np.where(is_hp, params["price_hp"], params["price_hc"])
@@ -787,9 +959,18 @@ def demand_charge_rate_for_mode(mode_vente: str, tarif_capacitaire_fournisseur: 
 
 def prix_vente_annee(prix_base: float, year: int, revision_pct: float = 0.0,
                       periode_revision_annees: int = 5) -> float:
+    """
+    Applique une revision PAR PALIERS (pas une inflation continue annee par
+    annee) au prix de vente fixe au client : le prix reste constant pendant
+    periode_revision_annees, puis saute de revision_pct, etc. Par exemple avec
+    periode_revision_annees=5 et revision_pct=0.1, le prix est le meme pour
+    les annees 1 a 5, puis +10% pour les annees 6 a 10, etc. Retourne
+    prix_base inchange si revision_pct vaut 0 ou si periode_revision_annees
+    est None (pas de revision contractuelle).
+    """
     if revision_pct == 0.0 or periode_revision_annees is None:
         return prix_base
-    n_revisions = (year - 1) // periode_revision_annees
+    n_revisions = (year - 1) // periode_revision_annees  # division entiere : nombre de paliers de revision deja franchis avant cette annee.
     return prix_base * (1 + revision_pct) ** n_revisions
 
 
@@ -921,6 +1102,19 @@ class YearDispatchContext:
 
 
 def _dispatch_one_year(year: int, ctx: YearDispatchContext):
+    """
+    Calcule la ligne de resultat economique pour UNE annee donnee de
+    l'horizon (year va de 1 a horizon_annees), a partir des donnees/parametres
+    communs a toutes les annees (ctx). C'est ici que sont appliquees, annee
+    apres annee : la degradation de la production PV (degr_pv), la
+    degradation ET l'eventuel remplacement de la batterie (degr_batt,
+    annee_remplacement_batterie), l'inflation sur les couts et tarifs
+    (inflation), et l'eventuelle revision du prix de vente au client
+    (revision_prix_pct). Concu pour etre appelable depuis un processus
+    separe (voir _dispatch_years / ProcessPoolExecutor) : ne depend d'aucun
+    etat global mutable, uniquement de `year` et `ctx` (tous deux picklables).
+    Retourne un dict de resultats (une ligne du DataFrame final `detail_annuel`).
+    """
     conso_all = ctx.conso_all
     pv_all_year1 = ctx.pv_all_year1
     market_price_values = ctx.market_price_values
@@ -943,9 +1137,17 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
     price_export_year1 = ctx.price_export_year1
     dispatch_fn = ctx.dispatch_fn
 
+    # Degradation PV composee annee par annee : degr_pv est un taux annuel
+    # (ex. 0.5%/an), applique en exposant (year-1) pour que l'annee 1 utilise
+    # la production nominale pv_all_year1 telle quelle (facteur = 1).
     pv_year = pv_all_year1 * ((1 - degr_pv) ** (year - 1))
 
     if annee_remplacement_batterie is not None and year >= annee_remplacement_batterie:
+        # La batterie a ete remplacee : son "age" redemarre a 0 l'annee du
+        # remplacement (une batterie neuve n'a pas la degradation cumulee de
+        # l'ancienne), d'ou la degradation appliquee ci-dessous repartant
+        # de e_max_year1 (capacite nominale d'origine, supposee identique
+        # pour la batterie de remplacement).
         age_batterie = year - annee_remplacement_batterie
     else:
         age_batterie = year - 1
@@ -957,6 +1159,11 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
     maintenance_year = params["maintenance_eur_an"] * inflation_factor
 
     if use_belpex:
+        # Mode "fournisseur_principal" : marge, taxes et marge d'injection
+        # sont indexes sur l'inflation comme n'importe quel cout/tarif fixe.
+        # Le prix de marche Day-Ahead lui-meme (mp_year) n'est indexe que si
+        # APPLIQUER_INFLATION_AU_PRIX_MARCHE est active (False par defaut :
+        # le prix de gros n'est pas suppose suivre l'inflation domestique).
         marge_f_year = params["marge_fournisseur"] * inflation_factor
         taxes_year = params["taxes_couts_proportionnels"] * inflation_factor
         marge_inj_year = params["marge_injection"] * inflation_factor
@@ -1001,15 +1208,27 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
         cout_appro_total = demand_charge_total + maintenance_year
         dont_energie_eur = 0.0
     else:
+        # Modes "fournisseur_principal" et "vente_directe" : le fournisseur
+        # (ou le client, en vente_directe) vend TOUTE la consommation du
+        # client (pas seulement le PV) au prix fixe prix_vente_kwh, et
+        # s'approvisionne au cout reel du dispatch (energy_cost) + tarif
+        # capacitaire + maintenance + frais fixes reseau.
         frais_fixes_reseau_year = params["old_cout_additionnel_contrat"] * inflation_factor
         cout_appro_total = energy_cost + demand_charge_total + maintenance_year + frais_fixes_reseau_year
 
+        # Optimisation : si aucune revision de prix n'est configuree
+        # (revision_prix_pct falsy), le revenu client est constant sur tout
+        # l'horizon -> on reutilise directement revenue_client_year1 au lieu
+        # de refaire le meme calcul (prix_vente_annee renverrait de toute
+        # facon prix_base inchange, mais ceci evite le recalcul de la somme).
         revenue_client_year = prix_vente_annee(
             params["prix_vente_kwh"], year, revision_prix_pct, periode_revision_annees
         ) * float(conso_all.sum()) if revision_prix_pct else revenue_client_year1
         old_cost_year = old_cost_year1 * inflation_factor
         dont_energie_eur = energy_cost
 
+    # Le cout de remplacement de la batterie n'est impute qu'a l'annee exacte
+    # du remplacement (capex ponctuel, pas amorti sur plusieurs annees).
     capex_remplacement_year = (
         cout_remplacement_batterie_eur
         if (annee_remplacement_batterie is not None and year == annee_remplacement_batterie)
@@ -1017,7 +1236,7 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
     )
 
     gross_profit_year = revenue_client_year - cout_appro_total - capex_remplacement_year
-    client_savings_year = old_cost_year - revenue_client_year
+    client_savings_year = old_cost_year - revenue_client_year  # ce que le client economise cette annee-la par rapport a son ancien fournisseur/tarif.
 
     return {
         "annee": year,
@@ -1182,11 +1401,15 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
     degr_pv = params["degradation_pv_pct"] / 100.0
     degr_batt = params["degradation_batterie_pct"] / 100.0
 
-    capex_pv = params["kwc"] * params["prix_kwc_pv"]
-    capex_batterie = params["battery_capacity_kwh"] * params["prix_kwh_batterie"]
+    capex_pv = params["kwc"] * params["prix_kwc_pv"]  # kWc installe * EUR/kWc.
+    capex_batterie = params["battery_capacity_kwh"] * params["prix_kwh_batterie"]  # kWh de capacite installee * EUR/kWh.
     capex_total = capex_pv + capex_batterie
 
     if cout_remplacement_batterie_eur is None:
+        # Par defaut, le remplacement de la batterie coute autant que
+        # l'installation initiale (meme prix_kwh_batterie, meme capacite) --
+        # l'appelant peut fournir un montant different si le prix futur
+        # anticipe de la technologie batterie differe du prix actuel.
         cout_remplacement_batterie_eur = capex_batterie
 
     conso_totale = float(conso_all.sum())
@@ -1313,6 +1536,13 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
 
     result["cashflow_cumule_eur"] = result["cashflow_annuel_eur"].cumsum() - capex_total
 
+    # Temps de retour sur investissement (payback), en annees FRACTIONNAIRES :
+    # on cherche la premiere annee ou le cashflow cumule (net du CAPEX) devient
+    # positif ou nul, puis on interpole LINEAIREMENT entre le cumul de l'annee
+    # precedente (encore negatif) et celui de cette annee-la pour estimer a
+    # quel moment DANS l'annee le seuil de rentabilite est franchi (frac est la
+    # fraction d'annee ecoulee au moment du franchissement). payback_year reste
+    # None si le cashflow cumule ne redevient jamais positif sur tout l'horizon.
     payback_year = None
     for i, r in result.iterrows():
         if r["cashflow_cumule_eur"] >= 0:
@@ -1322,9 +1552,15 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
             break
 
     total_gain_brut = result["cashflow_annuel_eur"].sum()
-    roi_pct = 100 * (total_gain_brut - capex_total) / capex_total if capex_total > 0 else float("nan")
+    roi_pct = 100 * (total_gain_brut - capex_total) / capex_total if capex_total > 0 else float("nan")  # ROI net NON actualise (ne tient pas compte de la valeur temps de l'argent, contrairement a la VAN/TRI ci-dessous).
     total_economie_client = result["economie_client_eur"].sum()
 
+    # VAN (NPV) et TRI (IRR) calcules sur la sequence de cashflows : -CAPEX a
+    # l'annee 0, puis le cashflow annuel net (deja net du remplacement
+    # batterie eventuel, voir cashflow_annuel_eur) pour chaque annee de
+    # l'horizon -- voir engine.finance_utils.compute_npv_irr pour le detail
+    # de calcul (actualisation au taux discount_rate, recherche de racine
+    # pour le TRI).
     cashflows = [-capex_total] + result["cashflow_annuel_eur"].tolist()
     npv, irr = compute_npv_irr(cashflows, discount_rate)
 

@@ -96,11 +96,16 @@ def compute_fiche(params: dict) -> dict:
     taux_interet = p["taux_interet"]                          # S7
     annuite, interets_periode, capital_periode = _amortization_schedule(
         taux_interet, duree_financement, montant_financement)
+    # Total des interets payes sur toute la duree = somme des annuites moins
+    # le capital initialement emprunte (equivalent a sum(interets_periode)).
     total_interets = annuite * duree_financement - montant_financement  # S9
 
     # --- Tableau annuel (25 ans) --------------------------------------------
-    annees = np.arange(1, NB_ANNEES + 1)
+    annees = np.arange(1, NB_ANNEES + 1)  # index 1..25 (annee civile du projet, pas index array)
 
+    # Degradation panneaux PV : production annee 1 = estimation initiale,
+    # annee 2 = -1% (rodage), puis -0.4%/an a partir de l'annee 3 -- courbe de
+    # degradation typique d'un fabricant PV, reproduite telle quelle depuis le classeur source.
     production = np.empty(NB_ANNEES)
     production[0] = production_totale_estimee
     if NB_ANNEES > 1:
@@ -108,9 +113,14 @@ def compute_fiche(params: dict) -> dict:
         for i in range(2, NB_ANNEES):
             production[i] = production[i - 1] * PV_DEGRADATION_YEAR3PLUS_FACTOR
 
+    # Le financement (entree de cash) n'intervient qu'a l'annee 1 (deblocage
+    # du pret) -- les annees suivantes ne comportent que le remboursement.
     financement = np.zeros(NB_ANNEES)
     financement[0] = montant_financement
 
+    # Revenu de la revente d'electricite, uniquement pendant la periode
+    # d'exploitation contractuelle (annees_exploitation_fw), avec indexation
+    # composee du prix de vente. Au-dela, ce revenu s'arrete (fin de contrat).
     facturation_elec = np.where(
         annees <= annees_exploitation_fw,
         production * p["prix_vente_kwh"] * (1 + p["indexation_pct"]) ** (annees - 1),
@@ -122,6 +132,9 @@ def compute_fiche(params: dict) -> dict:
 
     cv = production * p["valeur_cv_eur_mwh"] / 1000.0  # G9 en €/MWh
 
+    # Symetrique de facturation_elec : apres la fin du contrat d'exploitation,
+    # le client reprend a sa charge maintenance et nettoyage, factures ici en
+    # cash flow POSITIF cote fournisseur (il facture desormais ces prestations).
     facturation_maintenance = np.where(
         annees > annees_exploitation_fw,
         kwc * p["frais_maintenance_eur_kwc"] * (1 + p["indexation_maintenance_pct"]) ** (annees - 1),
@@ -158,6 +171,10 @@ def compute_fiche(params: dict) -> dict:
         annees <= annees_exploitation_fw,
         p["frais_assurance_pct"] * capex * (1 + p["indexation_maintenance_pct"]) ** (annees - 1),
         0.0)
+    # Meme formule que facturation_maintenance/nettoyage ci-dessus mais cote
+    # DEPENSE : pendant le contrat, c'est le fournisseur qui paie ces couts
+    # (charge, cash flow negatif) -- apres, c'est le client (cash flow positif
+    # via facturation_maintenance/nettoyage). Montants identiques par symetrie.
     maintenance_monitoring = np.where(
         annees <= annees_exploitation_fw,
         kwc * p["frais_maintenance_eur_kwc"] * (1 + p["indexation_maintenance_pct"]) ** (annees - 1),
@@ -197,6 +214,9 @@ def compute_fiche(params: dict) -> dict:
 
     # --- Prix de revient / marge brute (M4, M7) -----------------------------
     opex_total = float(assurance.sum() + maintenance_monitoring.sum() + nettoyage.sum())  # B8
+    # Prix de revient = cout total du projet (annuites + apport + OPEX) lisse
+    # sur la production totale attendue pendant la periode d'exploitation --
+    # PAS sur les 25 ans complets (denom utilise annees_exploitation_fw, pas NB_ANNEES).
     denom = annees_exploitation_fw * production_totale_estimee
     prix_revient_kwh = ((duree_financement * annuite + apport_eur + opex_total) / denom
                          if denom else float("nan"))
@@ -208,8 +228,12 @@ def compute_fiche(params: dict) -> dict:
     payback_year = None
     payback_fraction = 0.0
     for i in range(NB_ANNEES - 1):
+        # Detecte l'annee ou le resultat cumule passe de negatif/nul a
+        # strictement positif (premier "franchissement du zero").
         if resultat_cumule[i] <= 0 < resultat_cumule[i + 1]:
             payback_year = annees[i]
+            # Interpolation lineaire entre les deux annees encadrantes pour
+            # affiner le payback en fraction d'annee (ex: 3.4 ans).
             payback_fraction = -resultat_cumule[i] / (-resultat_cumule[i] + resultat_cumule[i + 1])
             break
     payback = (payback_year + payback_fraction) if payback_year is not None else 0.0
@@ -263,6 +287,8 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
     p = fiche["params"]
     df = fiche["detail_annuel"]
 
+    # Petite fabrique de tableau ReportLab avec le style visuel commun aux
+    # blocs de parametres (fond gris clair, alignement des valeurs a droite).
     def param_table(rows, col_widths):
         t = Table(rows, colWidths=col_widths)
         t.setStyle(TableStyle([
@@ -403,6 +429,9 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
     header = ["Poste"] + [f"An {int(a)}" for a in df["annee"]]
     table_rows = [header]
     for label, col, fmt in row_defs:
+        # Extrait le nombre de decimales depuis la chaine de format (ex.
+        # ",.0f" -> 0) : tous les postes sont actuellement formates en entier,
+        # mais ce parsing permet de changer la precision par ligne dans row_defs.
         decimals = int(fmt.split(".")[1].rstrip("f")) if "." in fmt else 0
         table_rows.append([label] + [_fmt_number(v, decimals=decimals) for v in df[col]])
 
@@ -420,12 +449,15 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ("LEFTPADDING", (0, 0), (-1, -1), 2),
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        # Indices de lignes 8/16 = position fixe de "Cash flows positifs" et
+        # "Cash flows negatifs" dans row_defs (+1 pour la ligne d'en-tete) --
+        # a mettre a jour si l'ordre de row_defs change.
         ("LINEBELOW", (0, 8), (-1, 8), 0.6, NAVY),  # separateur avant cash flows positifs
         ("LINEBELOW", (0, 16), (-1, 16), 0.6, NAVY),  # separateur avant cash flows negatifs
         ("FONTNAME", (0, 8), (-1, 8), "Helvetica-Bold"),
         ("FONTNAME", (0, 16), (-1, 16), "Helvetica-Bold"),
-        ("FONTNAME", (0, -2), (-1, -2), "Helvetica-Bold"),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (0, -2), (-1, -2), "Helvetica-Bold"),  # resultat annuel
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),  # resultat cumule
     ]))
     story.append(t_annuel)
 

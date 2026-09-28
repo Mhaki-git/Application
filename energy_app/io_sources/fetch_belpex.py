@@ -39,8 +39,19 @@ OUTPUT_DIR = os.path.join(_APP_ROOT, "data")
 
 
 def fetch_belpex_year(year: int, api_key: str) -> pd.Series:
+    """
+    Telecharge les prix Day-Ahead horaires (EUR/MWh cote API, convertis en
+    EUR/kWh) pour la zone de reglage belge, sur l'annee civile `year`.
+
+    Retourne une pd.Series indexee par datetime horaire naive (Europe/Brussels),
+    triee et dedupliquee. Leve RuntimeError si ENTSO-E ne renvoie aucune donnee
+    (cle API invalide, annee non encore publiee, etc.).
+    """
     client = EntsoePandasClient(api_key=api_key)
 
+    # Bornes [start, end) : toute l'annee civile, en heure locale Bruxelles
+    # (ENTSO-E convertit en interne, mais on veut aligner la requete sur les
+    # memes limites que la donnee client, qui raisonne en calendrier local).
     start = pd.Timestamp(f"{year}-01-01", tz="Europe/Brussels")
     end = pd.Timestamp(f"{year + 1}-01-01", tz="Europe/Brussels")
 
@@ -74,6 +85,12 @@ def fetch_belpex_year(year: int, api_key: str) -> pd.Series:
 
 
 def main():
+    """
+    Point d'entree CLI : telecharge les prix Belpex de l'annee donnee via
+    l'API ENTSO-E et les fige dans data/belpex_<annee>_qh.pkl. A executer une
+    seule fois par annee, jamais depuis l'application Streamlit (qui n'a pas
+    de cle API ENTSO-E et se contente de relire le fichier .pkl produit ici).
+    """
     if len(sys.argv) != 3:
         print("Usage : python fetch_belpex.py <annee> <cle_api_entsoe>")
         print("Exemple : python fetch_belpex.py 2024 abcd1234-...")

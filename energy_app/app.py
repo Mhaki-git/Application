@@ -30,6 +30,8 @@ PV_PROFILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data
 
 @st.cache_data
 def _load_pv_profile_1kwc(path: str):
+    # Cache Streamlit : evite de relire le pickle a chaque rerun (le fichier ne
+    # change jamais en cours de session), cle sur le chemin passe en argument.
     return pd.read_pickle(path)
 
 # ---------------------------------------------------------------------
@@ -87,12 +89,18 @@ theme_mode = st.session_state["theme_mode"]
 
 
 def _toggle_theme() -> None:
+    """Bascule clair/sombre : callback du bouton de theme (on_click), execute avant le
+    rerun declenche par Streamlit suite au clic. Met a jour le session_state ET
+    l'URL (query_params) pour que le choix survive a un rechargement de page."""
     new_mode = "dark" if st.session_state["theme_mode"] == "light" else "light"
     st.session_state["theme_mode"] = new_mode
     st.query_params["theme"] = new_mode
 
 
 def _apply_streamlit_theme(mode: str) -> bool:
+    """Applique les options de theme Streamlit correspondant a `mode` a la config
+    globale du serveur, et indique si un changement a effectivement eu lieu (pour
+    savoir si un st.rerun est necessaire -- voir l'appel juste en dessous)."""
     changed = False
     for key, value in THEMES[mode]["streamlit"].items():
         if _st_config.get_option(key) != value:
@@ -170,6 +178,7 @@ st.markdown(f"""
 
 
 def _section(num: int, title: str, desc: str = "") -> None:
+    """Affiche l'en-tete numerote d'une section principale de la page (ex: "01 Donnees du site")."""
     desc_html = f'<div class="sec-desc">{desc}</div>' if desc else ""
     st.markdown(
         f'<div class="sec"><span class="sec-num">{num:02d}</span>'
@@ -178,19 +187,24 @@ def _section(num: int, title: str, desc: str = "") -> None:
 
 
 def _group(label: str, container=st) -> None:
+    """Affiche un intitule de sous-groupe (petites majuscules) au sein d'une section."""
     container.markdown(f'<div class="grp">{label}</div>', unsafe_allow_html=True)
 
 
 def _note(text: str, warn: bool = False, container=st) -> None:
+    """Affiche une remarque discrete avec puce de couleur (teal = info, orange = avertissement)."""
     container.markdown(f'<div class="note{" warn" if warn else ""}"><span>{text}</span></div>', unsafe_allow_html=True)
 
 
 def _chart_title(title: str, sub: str = "") -> None:
+    """Affiche le titre (et sous-titre optionnel) d'un graphique, en dehors du canevas Plotly."""
     sub_html = f'<div class="chart-sub">{sub}</div>' if sub else ""
     st.markdown(f'<div class="chart-title">{title}</div>{sub_html}', unsafe_allow_html=True)
 
 
 def _kv_table(rows) -> None:
+    """Affiche un tableau cle/valeur HTML simple. `rows` est une liste de tuples
+    (cle, valeur, gras) ; `gras=True` met la ligne en evidence (ex: un total)."""
     html = "".join(
         f'<tr class="{"strong" if strong else ""}"><td>{k}</td><td>{v}</td></tr>'
         for k, v, strong in rows)
@@ -198,6 +212,9 @@ def _kv_table(rows) -> None:
 
 
 def _style_fig(fig, height: int, legend: bool = True):
+    """Applique le style commun (police, couleurs du theme actif, fond transparent,
+    grille, legende horizontale) a une figure Plotly, pour une apparence homogene
+    entre tous les graphiques et coherente avec le theme clair/sombre courant."""
     fig.update_layout(
         height=height,
         font=dict(family=CHART_FONT, size=12, color=PAL["axis_text"]),
@@ -254,10 +271,16 @@ with st.sidebar:
     run_hint = st.empty()
 
 st.session_state["mode"] = mode
+# Seul le mode "fournisseur_principal" fait du trading Belpex Day-Ahead ; les
+# deux autres modes pilotent la batterie sur le tarif reseau du client.
 use_belpex = (mode == "fournisseur_principal")
 
 
 def _stop_missing(message: str) -> None:
+    # `run_slot`/`run_hint` sont des st.empty() crees dans la sidebar : on les
+    # remplit ici avec un bouton desactive + message, puis st.stop() interrompt
+    # le script sans erreur (empeche d'atteindre les sections suivantes tant que
+    # les donnees de base -- conso et PV -- ne sont pas disponibles).
     st.info(message)
     run_slot.button("Lancer la simulation", type="primary", width="stretch",
                     disabled=True, key="run_disabled")
@@ -297,17 +320,27 @@ CONSO_PROFILE_LABELS = {
 
 @st.cache_data
 def _load_conso_profiles(path: str):
+    # Cache : le fichier de profils-types ne change pas en cours de session,
+    # inutile de le relire a chaque rerun.
     return pd.read_pickle(path)
 
 
 @st.cache_data(show_spinner=False)
 def _scaled_conso_profile(profile_key: str, conso_annuelle_kwh: float):
+    # Cache cle sur (profil choisi, consommation annuelle cible) : evite de
+    # refaire la mise a l'echelle a chaque rerun si ni l'un ni l'autre n'a
+    # change. show_spinner=False car l'operation est rapide (pas de retour
+    # visuel necessaire).
     from io_excel.dataextraction import conso_from_normalized_profile
     return conso_from_normalized_profile(
         _load_conso_profiles(CONSO_PROFILES_PATH)[profile_key], conso_annuelle_kwh)
 
 
 with col1.container(border=True):
+    # Deux sources mutuellement exclusives pour la consommation : soit un CSV
+    # importe par l'utilisateur, soit un profil-type integre (forme normalisee
+    # mise a l'echelle plus bas). Les variables conso_file/conso_series_profile
+    # sont utilisees plus loin pour savoir laquelle a ete fournie.
     _group("Consommation client")
     conso_source = st.radio(
         "Source",
@@ -355,6 +388,10 @@ with col1.container(border=True):
             )
 
 with col2.container(border=True):
+    # Deux sources pour le profil PV pour 1 kWc : soit le profil fige extrait
+    # une fois pour toutes depuis l'Excel (rapide, pas d'appel reseau), soit un
+    # appel a l'API PVGIS en direct (plus flexible sur la position/orientation
+    # mais plus lent et dependant du reseau).
     _group("Production PV")
     pv_source = st.radio(
         "Source",
@@ -391,6 +428,8 @@ with col2.container(border=True):
 
         @st.cache_data
         def _fetch_pv_pvgis(lat, lon, tilt, azimuth, loss):
+            # Cache cle sur les 5 parametres : evite de refaire l'appel reseau
+            # PVGIS a chaque rerun tant qu'aucun d'eux n'a change.
             from io_sources.pv_pvgis import fetch_pv_profile_1kwc
             return fetch_pv_profile_1kwc(lat, lon, tilt=tilt, azimuth=azimuth, system_loss_pct=loss)
 
@@ -407,6 +446,10 @@ belpex_upload_file = None
 
 if use_belpex:
     with st.container(border=True):
+        # Ce bloc ne fait que CHOISIR la source de prix (auto / annee forcee /
+        # upload / demo) ; la resolution effective du fichier de prix (lecture,
+        # troncature eventuelle) se fait plus bas, dans le bloc "Calcul", une
+        # fois les vraies dates de consommation du client connues.
         _group("Prix de marché · Belpex Day-Ahead")
         _belpex_annees_dispo = sorted([
             f.split("_")[1] for f in os.listdir(BELPEX_DATA_DIR)
@@ -531,6 +574,9 @@ has_battery = (battery_power_kw > 0) and (battery_capacity_kwh > 0)
 
 @st.cache_data(show_spinner=False)
 def _build_preview_timeseries_csv(conso_bytes: bytes, pv_profile: pd.Series, kwc_val: float, unit_val: str):
+    # Prend les bytes bruts du fichier (et non l'UploadedFile lui-meme, qui
+    # n'est pas hashable de maniere stable) pour que le cache Streamlit puisse
+    # cler dessus correctement. Reconstruit un buffer memoire a chaque appel.
     import io
     buf = io.BytesIO(conso_bytes)
     return build_timeseries_from_sources(buf, pv_profile, kwc=kwc_val, unit=unit_val)
@@ -538,6 +584,9 @@ def _build_preview_timeseries_csv(conso_bytes: bytes, pv_profile: pd.Series, kwc
 
 @st.cache_data(show_spinner=False)
 def _build_preview_timeseries_profile(conso_series: pd.Series, pv_profile: pd.Series, kwc_val: float):
+    # Cache pour l'apercu instantane (recalcule a chaque changement de widget
+    # dans "Installation") : evite de refaire l'alignement PV/conso si les
+    # entrees n'ont pas change depuis le dernier rerun.
     return build_timeseries_from_sources(conso_series, pv_profile, kwc=kwc_val)
 
 
@@ -552,12 +601,20 @@ def _simulate_battery_selfconso(pv_kwh: np.ndarray, conso_kwh: np.ndarray,
 _live_pvm = None
 _live_err = None
 try:
+    # Cet apercu est un calcul RAPIDE et SIMPLIFIE (dispatch glouton, pas de
+    # LP), recalcule a chaque changement de widget pour donner un retour
+    # immediat avant de lancer la simulation complete (couteuse, plusieurs
+    # minutes) via le bouton "Lancer la simulation" plus bas.
     if conso_series_profile is not None:
         _df_preview = _build_preview_timeseries_profile(conso_series_profile, pv_profile_1kwc, kwc)
     else:
         _df_preview = _build_preview_timeseries_csv(conso_file.getvalue(), pv_profile_1kwc, kwc, conso_unit)
     _pv_kwh_prev = _df_preview["pv_kwh"].values
     if kva_onduleur > 0:
+        # Ecretement onduleur : la puissance instantanee est plafonnee a la
+        # puissance de l'onduleur (kVA, cos phi = 1 suppose -> kVA ~= kW).
+        # Facteur 0.25 car les valeurs sont en kWh par pas de 15 minutes
+        # (kW * 0.25 h = kWh sur le quart d'heure).
         _pv_kwh_prev = np.minimum(_pv_kwh_prev, kva_onduleur * 0.25)
     _conso_kwh_prev = _df_preview["conso_kwh"].values
 
@@ -749,6 +806,9 @@ st.caption(
 )
 
 _RUN_LABEL = "Lancer la simulation"
+# Deux boutons identiques (sidebar + bas de page principale) pour l'ergonomie
+# sur une page longue ; des `key` distinctes evitent un conflit d'identifiant
+# Streamlit, et `submitted` est vrai si l'un OU l'autre a ete clique ce run-ci.
 _submit_side = run_slot.button(_RUN_LABEL, type="primary", icon=":material/play_arrow:",
                                width="stretch", key="run_side")
 run_hint.caption("Le dispatch Day-Ahead sur l'horizon complet peut prendre plusieurs minutes.")
@@ -853,6 +913,9 @@ if submitted:
         progress_bar = st.progress(0.0, text="Simulation en cours...")
 
         def _progress(year, total):
+            # Callback transmis au moteur LP (run_fournisseur_model_from_data) :
+            # appele une fois par annee de l'horizon pour faire avancer la barre
+            # de progression pendant un calcul qui peut durer plusieurs minutes.
             progress_bar.progress(year / total, text=f"Simulation en cours · année {year}/{total}")
 
         with st.spinner("Calcul du dispatch Day-Ahead sur l'horizon complet..."):
@@ -868,9 +931,16 @@ if submitted:
                 progress_callback=_progress,
             )
         progress_bar.empty()
+        # Les resultats sont stockes en session_state (et non dans une variable
+        # locale) car ils doivent survivre aux reruns suivants : la section 5 est
+        # affichee a partir de st.session_state["results"] en fin de script, meme
+        # lorsque le rerun est declenche par un widget interne au fragment (ex:
+        # changement de periode du graphique) plutot que par un nouveau calcul.
         st.session_state["results"] = results
         st.session_state["client_name"] = client_name
-        # Un nouveau calcul invalide les PDF generes pour le precedent.
+        # Un nouveau calcul invalide les PDF generes pour le precedent (sinon le
+        # bouton de telechargement continuerait de servir l'ancien rapport, qui
+        # ne correspondrait plus aux parametres/resultats affiches).
         st.session_state.pop("pdf_bytes", None)
         st.session_state.pop("fiche_pdf_bytes", None)
         if results["bilan_energetique_annee1"]["pv_total_kwh"] <= 0 and params["kwc"] > 0:
@@ -886,8 +956,17 @@ if submitted:
 # ---------------------------------------------------------------------
 @st.fragment
 def _render_results(results):
-    # Fragment : les widgets internes aux resultats (vue du profil, fiche
-    # financiere, exports) ne relancent que ce bloc, pas toute la page.
+    """Affiche la section 5 (resultats de la simulation deja calculee).
+
+    Isolee dans un fragment Streamlit : les widgets internes (selecteur de
+    periode du profil de charge, champs de la fiche financiere, boutons
+    d'export) ne relancent QUE ce fragment et non le script entier -- sans
+    cela, changer par exemple la date du profil de charge relancerait aussi
+    tout le reste de la page (sections 1 a 4, et surtout re-executerait la
+    simulation LP couteuse si `submitted` restait vrai). `results` est passe
+    en argument mais provient toujours de st.session_state["results"], seule
+    source de verite pour la persistance entre reruns.
+    """
     mode_label = st.session_state.get("mode", "fournisseur_principal")
     _rp = results["params"]
     df = results["detail_annuel"]
@@ -1266,7 +1345,7 @@ def _render_results(results):
         if serie is None or serie.empty:
             st.info("Pas de série quart-horaire disponible pour cette simulation.")
         else:
-            # Saisons astronomiques (bornes au 21 des mois, comme demande) :
+            # Saisons astronomiques (bornes au 21 des mois) :
             # Hiver 21 dec -> 20 mars, Printemps 21 mars -> 20 juin,
             # Ete 21 juin -> 20 sept, Automne 21 sept -> 20 dec.
             SEASON_ORDER = ["Hiver", "Printemps", "Été", "Automne"]

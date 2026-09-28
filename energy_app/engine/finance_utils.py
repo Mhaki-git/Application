@@ -18,7 +18,13 @@ def irr_from_cashflows(cashflows, start_period: int = 0):
     """
     irr = float("nan")
     try:
+        # f(r) = VAN au taux r. brentq a besoin d'un changement de signe entre
+        # les deux bornes pour garantir l'existence d'une racine (theoreme des
+        # valeurs intermediaires) -- sans ca, pas de recherche possible.
         f = lambda r: sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows, start=start_period))
+        # -0.99 (borne basse) evite la division par (1+r)=0 ; 10.0 (soit
+        # 1000% de rendement) est une borne haute jugee largement suffisante
+        # pour tout cas realiste. Si aucun changement de signe -> pas d'IRR.
         if f(-0.99) * f(10.0) < 0:
             irr = brentq(f, -0.99, 10.0)
     except Exception:
@@ -42,6 +48,9 @@ def irr_failure_reason(cashflows) -> str:
     """
     if len(cashflows) < 2:
         return "indetermine"
+    # On exclut le premier cashflow (investissement initial, generalement
+    # negatif) : seul le signe des flux suivants determine si le projet peut
+    # theoriquement s'annuler a un taux d'actualisation quelconque.
     rest = cashflows[1:]
     if all(cf >= 0 for cf in rest):
         return "toujours_rentable"
@@ -62,6 +71,8 @@ def pmt(rate: float, nper: int, pv: float) -> float:
     if nper <= 0:
         return 0.0
     if rate == 0:
+        # Cas particulier obligatoire : la formule generale divise par (1 -
+        # (1+r)**-n) qui vaut 0 quand r=0, division par zero sinon.
         return pv / nper
     return pv * rate / (1 - (1 + rate) ** (-nper))
 
@@ -74,11 +85,11 @@ def amortization_schedule(rate: float, nper: int, pv: float):
     Retourne (annuite, [interets_periode_1..nper], [capital_periode_1..nper]).
     """
     annuite = pmt(rate, nper, pv)
-    solde = pv
+    solde = pv  # capital restant du, decroit a chaque periode
     interets, capital = [], []
     for _ in range(nper):
-        interet = solde * rate
-        princ = annuite - interet
+        interet = solde * rate          # part interets de l'annuite (IPMT)
+        princ = annuite - interet       # part capital rembourse (PPMT)
         solde -= princ
         interets.append(interet)
         capital.append(princ)

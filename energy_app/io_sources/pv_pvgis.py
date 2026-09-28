@@ -44,7 +44,7 @@ def fetch_pv_profile_1kwc(lat: float, lon: float, tilt: float = 35.0,
         longitude=lon,
         start=year,
         end=year,
-        pvcalculation=True,
+        pvcalculation=True,     # demande le calcul de puissance PV (colonne "P"), pas seulement l'irradiance
         peakpower=1.0,          # on demande le profil pour 1 kWc, a l'echelle ensuite
         surface_tilt=tilt,
         surface_azimuth=azimuth,
@@ -52,6 +52,9 @@ def fetch_pv_profile_1kwc(lat: float, lon: float, tilt: float = 35.0,
         outputformat="json",
     )
 
+    # Garde-fou : si PVGIS change son format de reponse ou renvoie une erreur
+    # silencieuse (coordonnees hors zone de couverture, etc.), on echoue tot
+    # avec un message clair plutot que de propager un DataFrame incomplet.
     if "P" not in data.columns:
         raise RuntimeError(
             "Reponse PVGIS inattendue : pas de colonne 'P' (puissance AC). "
@@ -92,21 +95,34 @@ def expand_to_quarter_hour(hourly_profile_1kwc: pd.Series, kwc: float,
     # semantique identique : cle (mois, jour, heure), derniere valeur gardee
     # en cas de doublon, 29 fevrier -> 28 fevrier, sinon moyenne du profil.
     src_idx = pd.DatetimeIndex(hourly_profile_1kwc.index)
+    # Table de correspondance (mois, jour, heure) -> production (kWh/kWc).
+    # "keep='last'" : en cas de doublon (ex. chevauchement DST), on garde la
+    # derniere valeur rencontree, comme le faisait l'ancienne boucle.
     lookup = pd.Series(
         np.asarray(hourly_profile_1kwc.values, dtype=float),
         index=pd.MultiIndex.from_arrays([src_idx.month, src_idx.day, src_idx.hour]))
     lookup = lookup[~lookup.index.duplicated(keep="last")]
+    # Valeur de secours si une (mois, jour, heure) cible n'a aucune correspondance
+    # dans le profil PVGIS (ne devrait arriver que pour des cas limites de calendrier).
     fallback = float(np.nanmean(hourly_profile_1kwc.values))
 
-    hours = pd.DatetimeIndex(target_index).floor("h")
+    hours = pd.DatetimeIndex(target_index).floor("h")  # arrondit chaque quart d'heure a son heure pleine
     month, day, hour = hours.month, hours.day, hours.hour
     pos = lookup.index.get_indexer(pd.MultiIndex.from_arrays([month, day, hour]))
+    # PVGIS ne fournit pas le 29 fevrier (annee de reference non bissextile ou
+    # simplement absente) : si la cible tombe un 29/02, on retombe sur le 28/02
+    # a la meme heure plutot que sur la valeur de secours generique.
     is_feb29 = np.asarray((month == 2) & (day == 29))
     pos_feb28 = lookup.index.get_indexer(
         pd.MultiIndex.from_arrays([np.full(len(hours), 2), np.full(len(hours), 28), hour]))
     pos = np.where((pos < 0) & is_feb29, pos_feb28, pos)
 
     values = lookup.to_numpy()
+    # get_indexer renvoie -1 pour les positions non trouvees ; np.maximum(pos, 0)
+    # evite un index negatif invalide, et le np.where remplace ensuite ces cas
+    # (pos < 0, donc toujours non trouves a ce stade) par le fallback.
     qh_values = np.where(pos >= 0, values[np.maximum(pos, 0)], fallback)
+    # Repartition uniforme de la production horaire sur les 4 quarts d'heure :
+    # kWh/kWc horaire * kWc installes / 4 = kWh par quart d'heure.
     pv_kwh_qh = (qh_values * kwc) / 4.0
     return pd.Series(pv_kwh_qh, index=target_index, name="pv_kwh")

@@ -29,6 +29,10 @@ XLSM_PATH = "ENERGY MIX ANALYSIS - AMELIORATION (2).xlsm"
 # PARAM_CELL_MAP utilisent `valeur or 0`.
 _KEYS_WITHOUT_ZERO_FALLBACK = {"heure_debut_hp", "heure_debut_hc"}
 
+# Limites de securite pour le parcours ligne par ligne des onglets Excel
+# (arret normal = premiere colonne A vide, ces bornes ne servent qu'a eviter
+# un parcours illimite sur un fichier corrompu). 40000 lignes ~ un an de
+# quart-heures avec large marge ; 8900 lignes ~ un an d'heures avec marge.
 MAX_SCAN_ROWS_QH = 40000
 MAX_SCAN_ROWS_H = 8900
 
@@ -41,11 +45,28 @@ _CHAMPS_A_VERIFIER_SI_ZERO = {
 
 
 def _read_parameters(ws_de) -> dict:
+    """
+    Lit tous les parametres scalaires de l'onglet DONNEES ENERGIE, a partir des
+    adresses de cellules definies dans PARAM_CELL_MAP (source de verite partagee
+    avec excel_writer.py).
+
+    Piege : une cellule vide donne `None` en openpyxl. Pour la plupart des cles,
+    on retombe sur 0 (`valeur or 0`) afin d'eviter des `None` qui casseraient les
+    calculs downstream. Exception : les cles listees dans
+    _KEYS_WITHOUT_ZERO_FALLBACK (heures de debut HP/HC) ou `None` a un sens
+    different de 0 (0 serait interprete comme "minuit"), donc la valeur brute
+    est conservee telle quelle.
+
+    Retourne un dict {cle_parametre: valeur}, tel que defini par PARAM_CELL_MAP.
+    """
     params = {}
     for key, cell in PARAM_CELL_MAP.items():
         value = ws_de[cell].value
         params[key] = value if key in _KEYS_WITHOUT_ZERO_FALLBACK else (value or 0)
 
+    # Garde-fou : certains parametres a 0 sont techniquement valides mais
+    # neutralisent une partie du modele economique sans erreur explicite --
+    # on avertit au lieu d'echouer, pour laisser la main a l'utilisateur.
     for champ, description in _CHAMPS_A_VERIFIER_SI_ZERO.items():
         if not params[champ]:
             print(f"  /!\\ {champ} = 0 ({description}) -- confirme que c'est bien voulu, "
@@ -55,6 +76,22 @@ def _read_parameters(ws_de) -> dict:
 
 
 def _read_conso_series(ws_de, max_scan_rows: int = MAX_SCAN_ROWS_QH) -> pd.Series:
+    """
+    Lit la serie de consommation quart-horaire du client depuis l'onglet
+    DONNEES ENERGIE : colonne A = timestamp, colonne AC (index 28, 0-based)
+    = puissance moyenne en kW sur le quart d'heure.
+
+    L'arret de lecture est dynamique : on scanne ligne par ligne jusqu'a
+    trouver une colonne A vide (fin des donnees), dans la limite de
+    max_scan_rows pour eviter un parcours illimite si le fichier est corrompu.
+
+    Piege d'unite : la colonne AC est une PUISSANCE en kW (pas une energie),
+    d'ou la conversion `* 0.25` pour obtenir l'energie en kWh sur le quart
+    d'heure (0.25 h). Les cellules vides sont traitees comme 0 kW.
+
+    Retourne une pd.Series en kWh par quart d'heure, indexee par datetime,
+    dedupliquee (on garde la premiere occurrence en cas de timestamp repete).
+    """
     dates = []
     conso_kw = []
     for row in ws_de.iter_rows(min_row=2, max_row=1 + max_scan_rows,
@@ -69,7 +106,7 @@ def _read_conso_series(ws_de, max_scan_rows: int = MAX_SCAN_ROWS_QH) -> pd.Serie
         raise ValueError("Aucune date valide trouvee en colonne A de DONNEES ENERGIE.")
 
     conso_kw = np.array(conso_kw, dtype=float)
-    conso_kwh = conso_kw * 0.25
+    conso_kwh = conso_kw * 0.25  # kW moyen sur 15 min -> kWh (0.25 h)
     series = pd.Series(conso_kwh, index=pd.DatetimeIndex(dates), name="conso_kwh")
 
     if series.index.duplicated().any():
@@ -81,6 +118,26 @@ def _read_conso_series(ws_de, max_scan_rows: int = MAX_SCAN_ROWS_QH) -> pd.Serie
 
 
 def _read_pv_series(ws_pv, kwc: float, max_scan_rows: int = MAX_SCAN_ROWS_H) -> pd.Series:
+    """
+    Lit le profil de production PV depuis l'onglet PVS : colonne A = timestamp
+    (au pas HORAIRE, contrairement a la conso qui est quart-horaire), colonne
+    DL (index 115, 0-based) = production normalisee pour une installation de
+    1 kWc, en kWh par heure.
+
+    Les donnees demarrent a la ligne 5 (lignes 1-4 = en-tetes/metadonnees de
+    l'export PVS). Arret dynamique de lecture des que la colonne A est vide,
+    dans la limite de max_scan_rows.
+
+    Mise a l'echelle : la production pour 1 kWc est multipliee par `kwc`
+    (puissance crete reelle de l'installation, en kWc) pour obtenir l'energie
+    horaire reelle, puis divisee par 4 pour repartir uniformement cette
+    energie horaire sur les 4 quarts d'heure de l'heure (desagregation
+    horaire -> quart-horaire par simple division, sans modeliser de variation
+    infra-horaire).
+
+    Retourne une pd.Series en kWh par quart d'heure (index quart-horaire),
+    alignee sur la meme granularite que la conso, dedupliquee.
+    """
     dates = []
     pv_1kwc = []
     for row in ws_pv.iter_rows(min_row=5, max_row=4 + max_scan_rows,
@@ -95,8 +152,10 @@ def _read_pv_series(ws_pv, kwc: float, max_scan_rows: int = MAX_SCAN_ROWS_H) -> 
         raise ValueError("Aucune date valide trouvee en colonne A de PVS.")
 
     pv_1kwc = np.array(pv_1kwc, dtype=float)
-    pv_kwh_per_quarter = pv_1kwc * kwc / 4.0
+    pv_kwh_per_quarter = pv_1kwc * kwc / 4.0  # kWh/h pour l'installation -> kWh par quart d'heure
 
+    # Desagregation horaire -> quart-horaire : on duplique la meme valeur
+    # (energie/4) sur les 4 sous-pas de 15 min de chaque heure source.
     qh_index = []
     qh_values = []
     for t, v in zip(dates, pv_kwh_per_quarter):
@@ -113,13 +172,27 @@ def _read_pv_series(ws_pv, kwc: float, max_scan_rows: int = MAX_SCAN_ROWS_H) -> 
 
 
 def extract_all(xlsm_path: str = XLSM_PATH, kwc: float = None):
+    """
+    Point d'entree "legacy Excel" : lit integralement le classeur .xlsm
+    (parametres + series temporelles conso/PV) et retourne (params, df) prets
+    a l'emploi pour le moteur de dispatch. Voir le docstring de module pour le
+    statut de cette fonction (chemin legacy, plus utilise par l'UI Streamlit).
+
+    - `data_only=True` : recupere les valeurs calculees des formules Excel
+      (pas les formules elles-memes).
+    - `read_only=True` : mode lecture seule d'openpyxl, plus rapide et plus
+      leger en memoire sur un gros classeur.
+
+    Retourne (params: dict, df: pd.DataFrame) -- df contient conso_kwh,
+    pv_kwh, hour, is_weekend, indexe par datetime quart-horaire.
+    """
     wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
     ws_de = wb[PARAMETERS_SHEET_NAME]
     ws_pv = wb["PVS"]
 
     params = _read_parameters(ws_de)
     if kwc is None:
-        kwc = params["kwc"]
+        kwc = params["kwc"]  # a defaut de kwc explicite, on utilise celui saisi dans le classeur
 
     print("Lecture conso quart-horaire (arret dynamique en fin de donnees)...")
     conso_series = _read_conso_series(ws_de)
@@ -130,8 +203,12 @@ def extract_all(xlsm_path: str = XLSM_PATH, kwc: float = None):
     print(f"  -> {len(pv_series)} points (apres desagregation QH), "
           f"de {pv_series.index[0]} a {pv_series.index[-1]}")
 
-    wb.close()
+    wb.close()  # libere le classeur des l'extraction terminee (mode read_only garde le fichier ouvert sinon)
 
+    # Jointure par index datetime : conso et PV n'ont pas forcement exactement
+    # les memes timestamps (sources differentes, arrets de lecture independants) ;
+    # le concat aligne sur l'union des index et laisse des NaN la ou une des deux
+    # series n'a pas de valeur a ce pas de temps.
     df = pd.concat([conso_series, pv_series], axis=1).sort_index()
     n_missing_conso = int(df["conso_kwh"].isna().sum())
     n_missing_pv = int(df["pv_kwh"].isna().sum())
@@ -143,7 +220,7 @@ def extract_all(xlsm_path: str = XLSM_PATH, kwc: float = None):
 
     df.index.name = "datetime"
     df["hour"] = df.index.hour
-    df["is_weekend"] = df.index.dayofweek >= 5
+    df["is_weekend"] = df.index.dayofweek >= 5  # 5=samedi, 6=dimanche (convention pandas dayofweek)
     return params, df
 
 
@@ -195,6 +272,18 @@ def _read_csv_robuste(csv_path_or_buffer) -> pd.DataFrame:
 
 
 def _read_raw_text(csv_path_or_buffer) -> str:
+    """
+    Lit le contenu texte brut d'un CSV, qu'il soit fourni par chemin (str) ou
+    par un objet fichier/buffer deja ouvert (ex: upload Streamlit, qui expose
+    `.read()`).
+
+    Le decodage force en "utf-8-sig" gere a la fois l'UTF-8 standard et le BOM
+    (byte order mark) qu'Excel ajoute systematiquement en tete des CSV exportes
+    depuis Windows -- sans ce mode, le BOM se retrouverait concatene au nom de
+    la premiere colonne et casserait sa detection automatique en aval.
+    `errors="replace"` evite un crash sur un octet mal encode isole plutot que
+    de faire echouer tout le chargement.
+    """
     if hasattr(csv_path_or_buffer, "read"):
         raw = csv_path_or_buffer.read()
         if isinstance(raw, bytes):
@@ -262,7 +351,7 @@ def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
         candidates = ["conso", "consommation", "value", "valeur", "kw", "kwh", "power", "puissance"]
         value_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[1])
 
-    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)
+    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)  # dayfirst=True : convention FR (JJ/MM/AAAA)
     values = df[value_col].apply(_parse_decimal_str)
     n_bad = int(values.isna().sum())
     if n_bad:
@@ -275,12 +364,15 @@ def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
     if len(series) < 2:
         raise ValueError("CSV de consommation : pas assez de lignes pour deduire le pas de temps.")
 
+    # Le pas de temps n'est jamais suppose a l'avance : on le deduit de l'ecart
+    # entre les deux premiers timestamps tries, ce qui permet de gerer 15/30/60 min
+    # (ou tout autre pas regulier) sans configuration manuelle.
     step_minutes = int(round((series.index[1] - series.index[0]).total_seconds() / 60))
     if step_minutes <= 0:
         raise ValueError("Impossible de deduire un pas de temps positif depuis le CSV de consommation.")
 
     if unit.lower() == "kw":
-        conso_kwh = series.values * (step_minutes / 60.0)
+        conso_kwh = series.values * (step_minutes / 60.0)  # puissance moyenne (kW) x duree (h) = energie (kWh)
     elif unit.lower() == "kwh":
         conso_kwh = series.values
     else:
@@ -317,7 +409,7 @@ def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
         candidates = ["prix", "price", "value", "valeur", "eur_kwh", "eur/kwh", "prix_eur_kwh"]
         value_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[1])
 
-    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)
+    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)  # dayfirst=True : convention FR (JJ/MM/AAAA)
     values = df[value_col].apply(_parse_decimal_str)
     n_bad = int(values.isna().sum())
     if n_bad:
@@ -325,12 +417,16 @@ def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
               f"Verifie le format de la colonne '{value_col}' si ce nombre est eleve.")
 
     series = pd.Series(values.values, index=pd.DatetimeIndex(ts), name="price_eur_kwh")
-    series = series.dropna()
+    series = series.dropna()  # lignes illisibles (n_bad ci-dessus) retirees plutot que mises a 0 : un prix a 0 fausserait le ROI, contrairement a une conso a 0 qui est plausible
     series = series[~series.index.duplicated(keep="first")].sort_index()
 
     if len(series) < 2:
         raise ValueError("CSV Day-Ahead : pas assez de lignes valides pour construire la serie.")
 
+    # Garde-fou d'unite : les prix Day-Ahead Belpex sont generalement publies en
+    # EUR/MWh alors que le moteur attend des EUR/kWh -- une mediane superieure a
+    # 2.0 EUR/kWh est trop elevee pour un prix electrique plausible et trahit
+    # presque toujours un oubli de conversion (diviser par 1000) en amont.
     med = float(np.nanmedian(np.abs(series.values)))
     if med > 2.0:
         print(f"  /!\\ ATTENTION UNITES : la mediane des prix chargee est {med:.1f} -- "
@@ -356,6 +452,10 @@ def align_conso_to_quarter_hour(conso_kwh: pd.Series) -> pd.Series:
         return conso_kwh
 
     if step_minutes > 15:
+        # Pas plus grossier que 15 min (ex: 30 ou 60 min) : on repartit l'energie
+        # du pas source a parts EGALES sur les n_qh quarts d'heure qu'il couvre.
+        # C'est un etalement uniforme, pas une reconstitution de la vraie courbe
+        # de charge infra-pas -- l'information de forme est perdue a la source.
         n_qh = step_minutes // 15
         qh_index = []
         qh_values = []
@@ -366,6 +466,8 @@ def align_conso_to_quarter_hour(conso_kwh: pd.Series) -> pd.Series:
                 qh_values.append(share)
         result = pd.Series(qh_values, index=pd.DatetimeIndex(qh_index), name="conso_kwh")
     else:
+        # Pas plus fin que 15 min : simple agregation par sommation d'energie
+        # (les kWh de sous-pas s'additionnent directement en kWh du quart d'heure).
         result = conso_kwh.resample("15min").sum()
 
     print(f"  /!\\ Conso reechantillonnee de {step_minutes} min vers 15 min "
@@ -403,6 +505,10 @@ def fill_missing_periods_by_calendar_symmetry(conso_kwh: pd.Series, step_minutes
     if len(conso_kwh) < 2:
         return conso_kwh, 0
 
+    # La grille cible est toujours l'annee civile complete de la premiere date
+    # du releve (peu importe le mois de depart reel des donnees) : 1er janvier
+    # 00:00 -> 31 decembre 23:45 (dernier quart d'heure de l'annee), au pas de
+    # temps demande.
     year = conso_kwh.index[0].year
     full_index = pd.date_range(
         pd.Timestamp(year=year, month=1, day=1),
@@ -430,7 +536,7 @@ def fill_missing_periods_by_calendar_symmetry(conso_kwh: pd.Series, step_minutes
         calendar_index.add(subkey=(ts.hour, ts.minute), month=ts.month, day=ts.day, value=val)
     calendar_index.finalize()
 
-    fallback_mean = float(conso_kwh.mean())
+    fallback_mean = float(conso_kwh.mean())  # utilise si aucun jour comparable n'est disponible pour un (heure, minute) donne
 
     def _closest_value(ts) -> float:
         return calendar_index.closest(
@@ -489,13 +595,18 @@ def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: p
     sans Excel : le reste du pipeline (run_fournisseur_model, etc.) n'a besoin
     d'aucune modification, il consomme ce DataFrame de la meme facon.
     """
-    from io_sources.pv_pvgis import expand_to_quarter_hour
+    from io_sources.pv_pvgis import expand_to_quarter_hour  # import local pour eviter une dependance circulaire au chargement du module
 
     n_truncated = 0
     if isinstance(conso_series_or_csv, pd.Series):
+        # Profil integre deja mis a l'echelle (conso_from_normalized_profile) :
+        # pas de completion calendaire necessaire, on suppose l'annee deja complete.
         print("Consommation client : profil integre deja en kWh/quart d'heure.")
         conso_qh = align_conso_to_quarter_hour(conso_series_or_csv)
     else:
+        # Cas CSV utilisateur : le releve peut etre partiel ou a un pas de temps
+        # different de 15 min, d'ou l'alignement puis la completion par symetrie
+        # calendaire pour obtenir une annee civile complete exploitable par le LP.
         print("Lecture de la consommation client (CSV)...")
         conso_raw = read_conso_csv(conso_series_or_csv, unit=unit)
         conso_qh = align_conso_to_quarter_hour(conso_raw)
@@ -509,19 +620,26 @@ def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: p
     df["pv_kwh"] = df["pv_kwh"].fillna(0.0)
     df.index.name = "datetime"
     df["hour"] = df.index.hour
-    df["is_weekend"] = df.index.dayofweek >= 5
+    df["is_weekend"] = df.index.dayofweek >= 5  # 5=samedi, 6=dimanche (convention pandas dayofweek)
 
     print(f"  -> Serie finale : {len(df)} points, conso={df['conso_kwh'].sum():,.0f} kWh/an, "
           f"pv={df['pv_kwh'].sum():,.0f} kWh/an")
-    df.attrs["n_truncated_qh"] = n_truncated
+    df.attrs["n_truncated_qh"] = n_truncated  # trace, pour affichage dans l'UI, du nombre de pas tronques lors de la completion calendaire
     return df
 
 
 def extract_parameters(xlsm_path: str = XLSM_PATH) -> dict:
+    """Raccourci pour ne recuperer que les parametres (sans les series
+    temporelles) via le chemin legacy Excel `extract_all`. Relit tout le
+    classeur (parametres + series) puis jette les series -- pas optimise,
+    mais coherent avec `extract_all` par construction."""
     params, _ = extract_all(xlsm_path)
     return params
 
 
 def extract_timeseries(xlsm_path: str = XLSM_PATH, kwc: float = None) -> pd.DataFrame:
+    """Raccourci pour ne recuperer que le DataFrame de series temporelles
+    (sans les parametres) via le chemin legacy Excel `extract_all`. Voir
+    extract_parameters : meme remarque sur le cout de relecture complete."""
     _, df = extract_all(xlsm_path, kwc=kwc)
     return df

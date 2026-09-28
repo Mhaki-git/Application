@@ -33,11 +33,17 @@ def extract_pv_profile_1kwc(xlsm_path: str) -> pd.Series:
     natif (pas de desagregation en quart-heure : ca, l'appli le fait a la
     volee via pv_pvgis.expand_to_quarter_hour, a partir de ce fichier fige).
     """
+    # data_only=True : on lit les valeurs calculees par Excel (pas les
+    # formules) ; read_only=True : mode flux, indispensable pour parcourir
+    # rapidement un fichier volumineux sans tout charger en memoire.
     wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
     ws = wb["PVS"]
 
     dates = []
     vals = []
+    # Colonne A = dates, colonne BX (index 115, 0-based -> colonne 116 en
+    # 1-based) = production pour 1 kWc. On s'arrete des qu'une date est vide
+    # (fin des donnees), plutot que de scanner jusqu'a MAX_SCAN_ROWS_H a chaque fois.
     for row in ws.iter_rows(min_row=5, max_row=4 + MAX_SCAN_ROWS_H,
                              min_col=1, max_col=116, values_only=True):
         d = row[0]
@@ -52,11 +58,19 @@ def extract_pv_profile_1kwc(xlsm_path: str) -> pd.Series:
 
     vals = np.array(vals, dtype=float)
     series = pd.Series(vals, index=pd.DatetimeIndex(dates), name="pv_kwh_per_kwc")
+    # Deduplique (garde la premiere occurrence) et trie par date -- au cas ou
+    # l'Excel contiendrait des lignes en double ou dans le desordre.
     series = series[~series.index.duplicated(keep="first")].sort_index()
     return series
 
 
 def main():
+    """
+    Point d'entree CLI : lit le chemin du fichier Excel en argument, extrait
+    le profil PV et le fige dans data/pv_profile_1kwc.pkl. A relancer
+    manuellement chaque fois que le profil source change -- ce script n'est
+    jamais appele par l'application Streamlit elle-meme.
+    """
     if len(sys.argv) != 2:
         print("Usage : python extract_pv_from_excel.py <chemin_vers_le_xlsm>")
         sys.exit(1)

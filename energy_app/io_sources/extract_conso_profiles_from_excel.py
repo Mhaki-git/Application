@@ -50,12 +50,17 @@ def extract_conso_profiles(xlsm_path: str) -> dict:
     Retourne un dict {cle_profil: pd.Series} -- chaque serie est indexee par
     datetime quart-horaire, et somme a 1.0 sur l'annee (verifie a l'extraction).
     """
+    # data_only=True : recupere les valeurs deja calculees par Excel ;
+    # read_only=True : lecture en flux, necessaire vu le volume potentiel
+    # (jusqu'a MAX_SCAN_ROWS_QH lignes, soit plusieurs annees au pas quart-horaire).
     wb = openpyxl.load_workbook(xlsm_path, data_only=True, read_only=True)
     ws = wb[SHEET_NAME]
 
     dates = []
     cols_vals = {col: [] for col in PROFILE_COLUMNS}
     max_col = max(PROFILE_COLUMNS)
+    # On s'arrete des que la colonne date (A) est vide -- fin des donnees --
+    # plutot que de lire systematiquement jusqu'a MAX_SCAN_ROWS_QH.
     for row in ws.iter_rows(min_row=2, max_row=1 + MAX_SCAN_ROWS_QH,
                              min_col=1, max_col=max_col, values_only=True):
         d = row[0]
@@ -75,8 +80,13 @@ def extract_conso_profiles(xlsm_path: str) -> dict:
     for col, key in PROFILE_COLUMNS.items():
         vals = np.array(cols_vals[col], dtype=float)
         series = pd.Series(vals, index=index, name=key)
+        # Deduplique (garde la premiere occurrence) et trie par date, comme
+        # pour le profil PV -- garantit un index propre avant mise a l'echelle.
         series = series[~series.index.duplicated(keep="first")].sort_index()
         total = float(series.sum())
+        # Verification d'invariant : un profil normalise doit sommer a 1.0 sur
+        # l'annee (tolerance +/-1% pour les arrondis Excel). Un ecart plus
+        # important signale une colonne source mal alignee ou corrompue.
         if not (0.99 <= total <= 1.01):
             print(f"  /!\\ Profil '{key}' : somme annuelle = {total:.4f} (attendu ~1.0) -- "
                   f"verifie la colonne source dans l'Excel.")
@@ -86,6 +96,12 @@ def extract_conso_profiles(xlsm_path: str) -> dict:
 
 
 def main():
+    """
+    Point d'entree CLI : lit le chemin du fichier Excel en argument, extrait
+    les profils de consommation et les fige dans data/conso_profiles.pkl.
+    A relancer manuellement chaque fois que les profils source changent --
+    ce script n'est jamais appele par l'application Streamlit elle-meme.
+    """
     if len(sys.argv) != 2:
         print("Usage : python extract_conso_profiles_from_excel.py <chemin_vers_le_xlsm>")
         sys.exit(1)
