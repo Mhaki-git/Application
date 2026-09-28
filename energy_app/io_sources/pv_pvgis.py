@@ -87,17 +87,26 @@ def expand_to_quarter_hour(hourly_profile_1kwc: pd.Series, kwc: float,
     # ignorant l'annee reelle de la donnee client vs l'annee PVGIS -- on
     # mappe uniquement par (mois, jour, heure) pour rester robuste aux
     # annees bissextiles / decalages de calendrier entre les deux sources.
-    lookup = {}
-    for ts, val in hourly_profile_1kwc.items():
-        lookup[(ts.month, ts.day, ts.hour)] = val
-
-    hours_needed = pd.DatetimeIndex(target_index).floor("h").unique()
-    hourly_kwh = {}
+    # Version vectorisee (l'ancienne boucle Python par quart d'heure prenait
+    # ~4 s par appel, soit a chaque changement de kWc dans l'apercu) --
+    # semantique identique : cle (mois, jour, heure), derniere valeur gardee
+    # en cas de doublon, 29 fevrier -> 28 fevrier, sinon moyenne du profil.
+    src_idx = pd.DatetimeIndex(hourly_profile_1kwc.index)
+    lookup = pd.Series(
+        np.asarray(hourly_profile_1kwc.values, dtype=float),
+        index=pd.MultiIndex.from_arrays([src_idx.month, src_idx.day, src_idx.hour]))
+    lookup = lookup[~lookup.index.duplicated(keep="last")]
     fallback = float(np.nanmean(hourly_profile_1kwc.values))
-    for h in hours_needed:
-        key = (h.month, h.day, h.hour)
-        hourly_kwh[h] = lookup.get(key, lookup.get((2, 28, h.hour) if h.month == 2 and h.day == 29 else key, fallback))
 
-    qh_values = np.array([hourly_kwh[ts.floor("h")] for ts in target_index], dtype=float)
+    hours = pd.DatetimeIndex(target_index).floor("h")
+    month, day, hour = hours.month, hours.day, hours.hour
+    pos = lookup.index.get_indexer(pd.MultiIndex.from_arrays([month, day, hour]))
+    is_feb29 = np.asarray((month == 2) & (day == 29))
+    pos_feb28 = lookup.index.get_indexer(
+        pd.MultiIndex.from_arrays([np.full(len(hours), 2), np.full(len(hours), 28), hour]))
+    pos = np.where((pos < 0) & is_feb29, pos_feb28, pos)
+
+    values = lookup.to_numpy()
+    qh_values = np.where(pos >= 0, values[np.maximum(pos, 0)], fallback)
     pv_kwh_qh = (qh_values * kwc) / 4.0
     return pd.Series(pv_kwh_qh, index=target_index, name="pv_kwh")

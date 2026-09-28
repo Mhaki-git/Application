@@ -2,13 +2,25 @@
 MODELE ECONOMIQUE "FOURNISSEUR" : economies client + rentabilite (ROI).
 (voir docstring complet dans le script d'origine fourni par l'utilisateur)
 """
+import os
+import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from pickle import PicklingError
 from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.optimize import linprog
+
+try:
+    # Acces direct a HiGHS (le solveur deja utilise par scipy.linprog) :
+    # ~2x plus rapide sur le LP journalier. Optionnel -- repli sur linprog.
+    import highspy
+except ImportError:  # pragma: no cover
+    highspy = None
 
 from io_excel.dataextraction import extract_all, XLSM_PATH as DEFAULT_XLSM_PATH
 from engine.finance_utils import compute_npv_irr
@@ -17,17 +29,44 @@ from engine.calendar_utils import NearestByCalendarSymmetry
 import sys
 
 
-class _Tee:
-    def __init__(self, *streams):
-        self.streams = streams
+class _ThreadLogRouter:
+    """
+    Remplace sys.stdout une fois pour toutes : tout est ecrit sur la sortie
+    d'origine et, pour le seul thread courant, duplique dans son fichier de
+    rapport (local.log). Remplace l'ancien echange global de sys.stdout, qui
+    melangeait les journaux de deux simulations lancees en meme temps
+    (Streamlit execute chaque session dans son propre thread) et pouvait
+    restaurer la mauvaise sortie.
+    """
+
+    def __init__(self, base):
+        self.base = base
+        self.local = threading.local()
 
     def write(self, data):
-        for s in self.streams:
-            s.write(data)
+        self.base.write(data)
+        log = getattr(self.local, "log", None)
+        if log is not None:
+            log.write(data)
 
     def flush(self):
-        for s in self.streams:
-            s.flush()
+        self.base.flush()
+        log = getattr(self.local, "log", None)
+        if log is not None:
+            log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
+_LOG_ROUTER_LOCK = threading.Lock()
+
+
+def _install_thread_log_router() -> "_ThreadLogRouter":
+    with _LOG_ROUTER_LOCK:
+        if not isinstance(sys.stdout, _ThreadLogRouter):
+            sys.stdout = _ThreadLogRouter(sys.stdout)
+        return sys.stdout
 
 
 XLSM_PATH = DEFAULT_XLSM_PATH
@@ -83,6 +122,30 @@ def _build_lp_skeleton(n: int):
 
 
 _LP_SKELETON = _build_lp_skeleton(STEPS_PER_DAY)
+
+DISPATCH_COLUMNS = ("charge_kwh", "decharge_kwh", "import_kwh", "export_kwh", "soc_kwh", "curtail_kwh")
+
+# Matrices d'egalite du LP (bilan + SOC) : ne dependent que de (N, eta_c, eta_d),
+# pas des donnees du jour -- construites une fois puis reutilisees (auparavant
+# reconstruites a chaque jour, ~5800 fois pour 15 ans).
+_A_EQ_CACHE = {}
+
+
+def _lp_equality_matrix(n: int, eta_c: float, eta_d: float):
+    key = (n, eta_c, eta_d)
+    a_eq = _A_EQ_CACHE.get(key)
+    if a_eq is None:
+        sk = _LP_SKELETON if n == STEPS_PER_DAY else _build_lp_skeleton(n)
+        i_n, z_n, s_n = sk["I_N"], sk["Z_N"], sk["S_N"]
+        a_soc = sparse.hstack([-eta_c * i_n, (1 / eta_d) * i_n, z_n, z_n,
+                               i_n - s_n, z_n, z_n, sk["zeros_col"]], format="csr")
+        a_eq = sparse.vstack([sk["A_balance"], a_soc], format="csr")
+        _A_EQ_CACHE[key] = a_eq
+    return a_eq
+
+
+def _dispatch_to_frame(arrays: dict) -> pd.DataFrame:
+    return pd.DataFrame({col: arrays[col] for col in DISPATCH_COLUMNS})
 
 
 def _align_market_price_to_calendar(market_price: pd.Series, target_index: pd.DatetimeIndex) -> pd.Series:
@@ -231,6 +294,13 @@ def build_tariff_reference(params: dict, hour_all: np.ndarray):
 
 def _dispatch_no_battery(conso, pv, price_import, price_export,
                           contrat_kw, peak_so_far_kw, dt=DT):
+    arrays, soc, new_peak, day_cost = _dispatch_no_battery_arrays(
+        conso, pv, price_import, price_export, contrat_kw, peak_so_far_kw, dt=dt)
+    return _dispatch_to_frame(arrays), soc, new_peak, day_cost
+
+
+def _dispatch_no_battery_arrays(conso, pv, price_import, price_export,
+                                 contrat_kw, peak_so_far_kw, dt=DT):
     """
     Fallback partage (LP et heuristique) quand e_max<=0 ou p_max<=0 : pas de
     batterie, autoconsommation directe uniquement, import/export plafonnes
@@ -249,39 +319,45 @@ def _dispatch_no_battery(conso, pv, price_import, price_export,
     overrun_cost = (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum()
     day_cost = float((imp * price_import - exp * price_export).sum() + overrun_cost)
     new_peak = max(peak_so_far_kw, (imp / dt).max() if N else 0.0)
-    dispatch = pd.DataFrame({
-        "charge_kwh": np.zeros(N), "decharge_kwh": np.zeros(N),
-        "import_kwh": imp, "export_kwh": exp, "soc_kwh": np.zeros(N),
+    zeros = np.zeros(N)
+    arrays = {
+        "charge_kwh": zeros, "decharge_kwh": zeros,
+        "import_kwh": imp, "export_kwh": exp, "soc_kwh": zeros,
         "curtail_kwh": curtail,
-    })
-    return dispatch, 0.0, new_peak, day_cost
+    }
+    return arrays, 0.0, new_peak, day_cost
 
 
 def solve_day_dispatch(conso, pv, price_import, price_export,
                         p_max, e_max, contrat_kw,
                         soc_init, peak_so_far_kw, demand_charge_rate,
                         eta_c=ETA_C, eta_d=ETA_D, dt=DT):
+    arrays, soc, new_peak, day_cost = _solve_day_lp_arrays(
+        conso, pv, price_import, price_export, p_max, e_max, contrat_kw,
+        soc_init, peak_so_far_kw, demand_charge_rate, eta_c=eta_c, eta_d=eta_d, dt=dt)
+    return _dispatch_to_frame(arrays), soc, new_peak, day_cost
+
+
+def _solve_day_lp_arrays(conso, pv, price_import, price_export,
+                         p_max, e_max, contrat_kw,
+                         soc_init, peak_so_far_kw, demand_charge_rate,
+                         eta_c=ETA_C, eta_d=ETA_D, dt=DT):
     N = len(conso)
 
     if contrat_kw <= 0:
         raise ValueError("contrat_kw (Excel N16) est nul ou absent.")
 
     if e_max <= 0 or p_max <= 0:
-        return _dispatch_no_battery(conso, pv, price_import, price_export,
-                                     contrat_kw, peak_so_far_kw, dt=dt)
+        return _dispatch_no_battery_arrays(conso, pv, price_import, price_export,
+                                            contrat_kw, peak_so_far_kw, dt=dt)
 
-    sk = _LP_SKELETON
-    I_N, S_N, zeros_col = sk["I_N"], sk["S_N"], sk["zeros_col"]
+    sk = _LP_SKELETON if N == STEPS_PER_DAY else _build_lp_skeleton(N)
 
-    A_balance = sk["A_balance"]
     b_balance = conso - pv
-
-    A_soc = sparse.hstack([-eta_c * I_N, (1 / eta_d) * I_N, sk["Z_N"], sk["Z_N"],
-                            I_N - S_N, sk["Z_N"], sk["Z_N"], zeros_col], format="csr")
     b_soc = np.zeros(N)
     b_soc[0] = soc_init
 
-    A_eq = sparse.vstack([A_balance, A_soc], format="csr")
+    A_eq = _lp_equality_matrix(N, eta_c, eta_d)
     b_eq = np.concatenate([b_balance, b_soc])
 
     A_peak = sk["A_peak"]
@@ -289,6 +365,44 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
 
     curtail_upper = np.maximum(pv, 0.0)
 
+    c = np.zeros(7 * N + 1)
+    c[2 * N:3 * N] = price_import
+    c[3 * N:4 * N] = -price_export
+    c[6 * N:7 * N] = price_import * OVERRUN_PENALTY_MULT
+    c[7 * N] = demand_charge_rate
+
+    if highspy is not None:
+        x = _solve_lp_highspy(N, eta_c, eta_d, c, b_eq, p_max, e_max, contrat_kw,
+                              curtail_upper, peak_so_far_kw, dt)
+    else:
+        x = _solve_lp_scipy(c, A_peak, b_peak, A_eq, b_eq, N, p_max, e_max, contrat_kw,
+                            curtail_upper, peak_so_far_kw, dt)
+
+    charge, decharge = x[0:N], x[N:2 * N]
+    imp, exp, soc = x[2 * N:3 * N], x[3 * N:4 * N], x[4 * N:5 * N]
+    curtail = x[5 * N:6 * N]
+    imp_overrun = x[6 * N:7 * N]
+    new_peak = x[7 * N]
+    day_cost = float((imp * price_import - exp * price_export).sum()
+                      + (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum())
+    arrays = {
+        "charge_kwh": charge, "decharge_kwh": decharge,
+        "import_kwh": imp, "export_kwh": exp, "soc_kwh": soc,
+        "curtail_kwh": curtail,
+    }
+    return arrays, soc[-1], new_peak, day_cost
+
+
+def _lp_not_converged(message, contrat_kw, p_max, e_max):
+    return RuntimeError(
+        f"LP journalier n'a pas converge : {message}. "
+        f"Verifie contrat_kw ({contrat_kw} kW), battery_power_kw ({p_max} kW) et "
+        f"battery_capacity_kwh ({e_max} kWh) vs les pics reels de conso/PV.")
+
+
+def _solve_lp_scipy(c, A_peak, b_peak, A_eq, b_eq, N, p_max, e_max, contrat_kw,
+                    curtail_upper, peak_so_far_kw, dt):
+    """Repli si highspy n'est pas installe : meme LP via scipy.optimize.linprog."""
     bounds = (
         [(0, p_max * dt)] * N
         + [(0, p_max * dt)] * N
@@ -300,39 +414,97 @@ def solve_day_dispatch(conso, pv, price_import, price_export,
         + [(peak_so_far_kw, None)]
     )
 
-    c = np.zeros(7 * N + 1)
-    c[2 * N:3 * N] = price_import
-    c[3 * N:4 * N] = -price_export
-    c[6 * N:7 * N] = price_import * OVERRUN_PENALTY_MULT
-    c[7 * N] = demand_charge_rate
-
     res = linprog(c, A_ub=A_peak, b_ub=b_peak, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
     if not res.success:
-        raise RuntimeError(
-            f"LP journalier n'a pas converge : {res.message}. "
-            f"Verifie contrat_kw ({contrat_kw} kW), battery_power_kw ({p_max} kW) et "
-            f"battery_capacity_kwh ({e_max} kWh) vs les pics reels de conso/PV.")
+        raise _lp_not_converged(res.message, contrat_kw, p_max, e_max)
+    return res.x
 
-    x = res.x
-    charge, decharge = x[0:N], x[N:2 * N]
-    imp, exp, soc = x[2 * N:3 * N], x[3 * N:4 * N], x[4 * N:5 * N]
-    curtail = x[5 * N:6 * N]
-    imp_overrun = x[6 * N:7 * N]
-    new_peak = x[7 * N]
-    day_cost = float((imp * price_import - exp * price_export).sum()
-                      + (imp_overrun * price_import * OVERRUN_PENALTY_MULT).sum())
-    dispatch = pd.DataFrame({
-        "charge_kwh": charge, "decharge_kwh": decharge,
-        "import_kwh": imp, "export_kwh": exp, "soc_kwh": soc,
-        "curtail_kwh": curtail,
-    })
-    return dispatch, soc[-1], new_peak, day_cost
+
+# Modele HiGHS reutilise d'un jour a l'autre (seuls couts, bornes et second
+# membre changent) : evite la couche de validation de scipy.linprog, qui
+# representait plus de la moitie du temps de resolution. Un modele par thread
+# (Streamlit execute chaque session dans son propre thread ; un objet Highs
+# n'est pas partage entre threads) et par (N, eta_c, eta_d).
+_HIGHS_LOCAL = threading.local()
+
+
+def _highs_day_model(n: int, eta_c: float, eta_d: float):
+    models = getattr(_HIGHS_LOCAL, "models", None)
+    if models is None:
+        models = _HIGHS_LOCAL.models = {}
+    key = (n, eta_c, eta_d)
+    model = models.get(key)
+    if model is None:
+        sk = _LP_SKELETON if n == STEPS_PER_DAY else _build_lp_skeleton(n)
+        # Meme ordre de lignes que scipy.linprog : inegalites (pic) puis egalites.
+        a = sparse.vstack([sk["A_peak"], _lp_equality_matrix(n, eta_c, eta_d)], format="csc")
+        n_col, n_row = 7 * n + 1, a.shape[0]
+        lp = highspy.HighsLp()
+        lp.num_col_ = n_col
+        lp.num_row_ = n_row
+        lp.col_cost_ = np.zeros(n_col)
+        lp.col_lower_ = np.zeros(n_col)
+        lp.col_upper_ = np.zeros(n_col)
+        lp.row_lower_ = np.zeros(n_row)
+        lp.row_upper_ = np.zeros(n_row)
+        lp.a_matrix_.format_ = highspy.MatrixFormat.kColwise
+        lp.a_matrix_.start_ = a.indptr
+        lp.a_matrix_.index_ = a.indices
+        lp.a_matrix_.value_ = a.data
+        h = highspy.Highs()
+        h.setOptionValue("output_flag", False)
+        h.passModel(lp)
+        model = (h, np.arange(n_col, dtype=np.int32), np.arange(n_row, dtype=np.int32))
+        models[key] = model
+    return model
+
+
+def _solve_lp_highspy(N, eta_c, eta_d, c, b_eq, p_max, e_max, contrat_kw,
+                      curtail_upper, peak_so_far_kw, dt):
+    h, col_idx, row_idx = _highs_day_model(N, eta_c, eta_d)
+    inf = highspy.kHighsInf
+
+    col_lower = np.zeros(7 * N + 1)
+    col_lower[7 * N] = peak_so_far_kw
+    col_upper = np.empty(7 * N + 1)
+    col_upper[0:2 * N] = p_max * dt
+    col_upper[2 * N:4 * N] = contrat_kw * dt
+    col_upper[4 * N:5 * N] = e_max
+    col_upper[5 * N:6 * N] = curtail_upper
+    col_upper[6 * N:] = inf  # imp_overrun (non borne mais penalise) et new_peak
+
+    row_lower = np.concatenate([np.full(N, -inf), b_eq])
+    row_upper = np.concatenate([np.zeros(N), b_eq])
+
+    # Pas de demarrage a chaud : reutiliser la base du jour precedent change
+    # l'optimum retenu quand plusieurs sont equivalents (ex: export a prix nul
+    # vs ecretement), donc les chiffres affiches -- on repart a froid comme
+    # scipy.linprog pour garder des resultats identiques.
+    h.clearSolver()
+    h.changeColsCost(len(col_idx), col_idx, c)
+    h.changeColsBounds(len(col_idx), col_idx, col_lower, col_upper)
+    h.changeRowsBounds(len(row_idx), row_idx, row_lower, row_upper)
+    h.run()
+    status = h.getModelStatus()
+    if status != highspy.HighsModelStatus.kOptimal:
+        raise _lp_not_converged(h.modelStatusToString(status), contrat_kw, p_max, e_max)
+    return np.asarray(h.getSolution().col_value)
 
 
 def solve_day_dispatch_heuristic(conso, pv, price_import, price_export,
                                   p_max, e_max, contrat_kw,
                                   soc_init, peak_so_far_kw, demand_charge_rate,
                                   eta_c=ETA_C, eta_d=ETA_D, dt=DT):
+    arrays, soc, new_peak, day_cost = _solve_day_heuristic_arrays(
+        conso, pv, price_import, price_export, p_max, e_max, contrat_kw,
+        soc_init, peak_so_far_kw, demand_charge_rate, eta_c=eta_c, eta_d=eta_d, dt=dt)
+    return _dispatch_to_frame(arrays), soc, new_peak, day_cost
+
+
+def _solve_day_heuristic_arrays(conso, pv, price_import, price_export,
+                                p_max, e_max, contrat_kw,
+                                soc_init, peak_so_far_kw, demand_charge_rate,
+                                eta_c=ETA_C, eta_d=ETA_D, dt=DT):
     """
     Dispatch HEURISTIQUE (pas de LP, pas d'arbitrage sur les prix) : reproduit
     le comportement d'un onduleur hybride standard en mode "self-consumption",
@@ -358,8 +530,8 @@ def solve_day_dispatch_heuristic(conso, pv, price_import, price_export,
         raise ValueError("contrat_kw (Excel N16) est nul ou absent.")
 
     if e_max <= 0 or p_max <= 0:
-        return _dispatch_no_battery(conso, pv, price_import, price_export,
-                                     contrat_kw, peak_so_far_kw, dt=dt)
+        return _dispatch_no_battery_arrays(conso, pv, price_import, price_export,
+                                            contrat_kw, peak_so_far_kw, dt=dt)
 
     charge = np.zeros(N)
     decharge = np.zeros(N)
@@ -403,12 +575,12 @@ def solve_day_dispatch_heuristic(conso, pv, price_import, price_export,
     day_cost = float((imp * price_import - exp * price_export).sum() + overrun_cost)
     new_peak = max(peak_so_far_kw, (imp / dt).max() if N else 0.0)
 
-    dispatch = pd.DataFrame({
+    arrays = {
         "charge_kwh": charge, "decharge_kwh": decharge,
         "import_kwh": imp, "export_kwh": exp, "soc_kwh": soc_arr,
         "curtail_kwh": curtail,
-    })
-    return dispatch, soc, new_peak, day_cost
+    }
+    return arrays, soc, new_peak, day_cost
 
 
 def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
@@ -422,44 +594,61 @@ def run_year_dispatch(conso_all, pv_all, price_import_all, price_export_all,
     total_export = 0.0
     total_import = 0.0
     total_curtail = 0.0
-    day_frames = [] if return_detail else None
+    day_arrays = [] if return_detail else None
+    months = np.asarray(index.month)
+
+    # Les fonctions de dispatch connues ont une variante interne qui renvoie
+    # des tableaux numpy : evite de construire puis relire un DataFrame par
+    # jour (c'etait ~60 % du temps en mode heuristique). Une dispatch_fn
+    # externe (tests, variante) passe toujours par le contrat DataFrame.
+    arrays_fn = _ARRAY_DISPATCH_IMPLS.get(dispatch_fn)
 
     for d in range(n_days):
         sl = slice(d * STEPS_PER_DAY, (d + 1) * STEPS_PER_DAY)
-        idx = index[sl]
-        month = idx[0].month
+        month = months[d * STEPS_PER_DAY]
         if month != current_month:
             if current_month is not None:
                 month_peaks[current_month] = peak_so_far
             current_month = month
             peak_so_far = 0.0
 
-        day_df, soc, new_peak, day_cost = dispatch_fn(
-            conso_all[sl], pv_all[sl], price_import_all[sl], price_export_all[sl],
-            p_max=p_max, e_max=e_max, contrat_kw=contrat_kw,
-            soc_init=soc, peak_so_far_kw=peak_so_far,
-            demand_charge_rate=demand_charge_rate,
-        )
+        day_args = (conso_all[sl], pv_all[sl], price_import_all[sl], price_export_all[sl])
+        day_kwargs = dict(p_max=p_max, e_max=e_max, contrat_kw=contrat_kw,
+                          soc_init=soc, peak_so_far_kw=peak_so_far,
+                          demand_charge_rate=demand_charge_rate)
+        if arrays_fn is not None:
+            day, soc, new_peak, day_cost = arrays_fn(*day_args, **day_kwargs)
+        else:
+            day_df, soc, new_peak, day_cost = dispatch_fn(*day_args, **day_kwargs)
+            day = {col: day_df[col].to_numpy() for col in DISPATCH_COLUMNS}
         peak_so_far = new_peak
         total_energy_cost += day_cost
-        total_export += float(day_df["export_kwh"].sum())
-        total_import += float(day_df["import_kwh"].sum())
-        total_curtail += float(day_df["curtail_kwh"].sum())
+        total_export += float(day["export_kwh"].sum())
+        total_import += float(day["import_kwh"].sum())
+        total_curtail += float(day["curtail_kwh"].sum())
 
         if return_detail:
-            day_df = day_df.copy()
-            day_df.index = idx
-            day_df["price_import"] = price_import_all[sl]
-            day_df["price_export"] = price_export_all[sl]
-            day_frames.append(day_df)
+            day_arrays.append(day)
 
     month_peaks[current_month] = peak_so_far
     demand_charge_total = demand_charge_rate * sum(month_peaks.values())
 
     if return_detail:
-        full_dispatch = pd.concat(day_frames)
+        n_pts = n_days * STEPS_PER_DAY
+        full_dispatch = pd.DataFrame(
+            {col: (np.concatenate([day[col] for day in day_arrays]) if day_arrays else np.zeros(0))
+             for col in DISPATCH_COLUMNS},
+            index=index[:n_pts])
+        full_dispatch["price_import"] = price_import_all[:n_pts]
+        full_dispatch["price_export"] = price_export_all[:n_pts]
         return total_energy_cost, demand_charge_total, total_import, total_export, total_curtail, full_dispatch
     return total_energy_cost, demand_charge_total, total_import, total_export, total_curtail
+
+
+_ARRAY_DISPATCH_IMPLS = {
+    solve_day_dispatch: _solve_day_lp_arrays,
+    solve_day_dispatch_heuristic: _solve_day_heuristic_arrays,
+}
 
 
 def decompose_gains(conso_all, pv_all, price_import_all, price_export_all,
@@ -611,7 +800,7 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
                            cout_remplacement_batterie_eur=25000,
                            revision_prix_pct=0.0,
                            periode_revision_annees=5,
-                           parallel_years=False,
+                           parallel_years=None,
                            rapport_txt_path=None,
                            progress_callback=None,
                            param_overrides=None,
@@ -647,9 +836,9 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
             revision_prix_pct, periode_revision_annees, parallel_years,
             progress_callback, param_overrides, data_source, output_csv_path)
 
-    stdout_original = sys.stdout
+    router = _install_thread_log_router()
     log_file = open(rapport_txt_path, "w", encoding="utf-8")
-    sys.stdout = _Tee(stdout_original, log_file)
+    router.local.log = log_file
     try:
         return _run_fournisseur_model_impl(
             xlsm_path, dayahead_pkl_path, horizon_annees, discount_rate,
@@ -657,7 +846,7 @@ def run_fournisseur_model(xlsm_path=XLSM_PATH, dayahead_pkl_path=DAYAHEAD_PKL_PA
             revision_prix_pct, periode_revision_annees, parallel_years,
             progress_callback, param_overrides, data_source, output_csv_path)
     finally:
-        sys.stdout = stdout_original
+        router.local.log = None
         log_file.close()
         print(f"\n(Rapport complet sauvegarde dans : {rapport_txt_path})")
 
@@ -725,6 +914,10 @@ class YearDispatchContext:
     price_import_year1: np.ndarray
     price_export_year1: np.ndarray
     dispatch_fn: Callable
+    # (energy_cost, demand_charge_total, import, export, curtail) du dispatch
+    # annee 1 deja calcule pour le detail quart-horaire : reutilise tel quel
+    # par _dispatch_one_year(1) au lieu de refaire les 365 LP a l'identique.
+    year1_dispatch: Optional[tuple] = None
 
 
 def _dispatch_one_year(year: int, ctx: YearDispatchContext):
@@ -777,12 +970,24 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
         price_import_year = price_import_year1 * inflation_factor
         price_export_year = price_export_year1 * inflation_factor
 
-    energy_cost, demand_charge_total, total_import, total_export, total_curtail = run_year_dispatch(
-        conso_all, pv_year, price_import_year, price_export_year,
-        p_max=p_max, e_max=e_max_year, contrat_kw=contrat_kw,
-        demand_charge_rate=demand_charge_year, index=index,
-        dispatch_fn=dispatch_fn,
+    # Annee 1 : entrees strictement identiques au dispatch deja fait pour le
+    # detail (facteurs d'inflation/degradation = 1) -- on verifie l'egalite
+    # exacte des prix par securite avant de reutiliser le resultat.
+    reuse_year1 = (
+        year == 1 and ctx.year1_dispatch is not None
+        and e_max_year == e_max_year1
+        and np.array_equal(price_import_year, price_import_year1)
+        and np.array_equal(price_export_year, price_export_year1)
     )
+    if reuse_year1:
+        energy_cost, demand_charge_total, total_import, total_export, total_curtail = ctx.year1_dispatch
+    else:
+        energy_cost, demand_charge_total, total_import, total_export, total_curtail = run_year_dispatch(
+            conso_all, pv_year, price_import_year, price_export_year,
+            p_max=p_max, e_max=e_max_year, contrat_kw=contrat_kw,
+            demand_charge_rate=demand_charge_year, index=index,
+            dispatch_fn=dispatch_fn,
+        )
 
     if params.get("mode_vente") == "fournisseur_secondaire":
         # Idem annee 1 : on ne vend que la production PV, au prix fixe --
@@ -829,6 +1034,55 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
         "export_reseau_kwh": total_export,
         "curtail_pv_kwh": total_curtail,
     }
+
+
+# Nombre maximal de processus pour le calcul des annees en parallele : chaque
+# processus charge numpy/scipy/pandas (~100 Mo), inutile d'en lancer plus que
+# necessaire -- 8 couvre un horizon de 15 ans en 2 vagues.
+MAX_YEAR_WORKERS = 8
+
+
+def _should_parallelize_years(parallel_years, dispatch_fn, p_max, e_max, n_years: int) -> bool:
+    """
+    parallel_years : True/False force le choix ; None = automatique. En
+    automatique, on ne parallelise que le dispatch LP avec batterie (~2 s par
+    annee) : l'heuristique et le cas sans batterie prennent quelques
+    centiemes de seconde par annee, moins que le demarrage des processus.
+    """
+    if n_years < 2 or (os.cpu_count() or 1) < 2:
+        return False
+    if parallel_years is not None:
+        return bool(parallel_years)
+    return dispatch_fn is solve_day_dispatch and p_max > 0 and e_max > 0
+
+
+def _dispatch_years(years, ctx: YearDispatchContext, parallel: bool, on_year_done=None) -> dict:
+    """
+    Calcule _dispatch_one_year pour chaque annee, en parallele si demande.
+    Les annees sont independantes (chacune repart de SOC_INIT_RATIO), donc le
+    resultat est identique a un calcul sequentiel. Retourne {annee: ligne}.
+    on_year_done(n_faites) est appele dans le processus principal.
+    """
+    rows = {}
+    if parallel:
+        n_workers = min(len(years), MAX_YEAR_WORKERS, max((os.cpu_count() or 2) - 1, 1))
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_dispatch_one_year, y, ctx): y for y in years}
+                for fut in as_completed(futures):
+                    rows[futures[fut]] = fut.result()
+                    if on_year_done:
+                        on_year_done(len(rows))
+            return rows
+        except (BrokenProcessPool, PicklingError, OSError) as e:
+            # Environnement sans multiprocessing fonctionnel : repli sequentiel.
+            print(f"  /!\\ Calcul parallele indisponible ({e!r}) -- repli sur un calcul sequentiel.")
+            rows = {}
+    for y in years:
+        rows[y] = _dispatch_one_year(y, ctx)
+        if on_year_done:
+            on_year_done(len(rows))
+    return rows
 
 
 def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, discount_rate,
@@ -1013,22 +1267,24 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
         revision_prix_pct=revision_prix_pct, periode_revision_annees=periode_revision_annees,
         use_belpex=use_belpex, price_import_year1=price_import_year1,
         price_export_year1=price_export_year1, dispatch_fn=dispatch_fn,
+        year1_dispatch=(energy_cost_y1, demand_charge_y1, import_y1, export_y1, curtail_y1),
     )
 
-    rows = []
-    for year in range(1, horizon_annees + 1):
-        # Annee 1 : passe par _dispatch_one_year comme toutes les autres
-        # annees (year=1 y redonne exactement pv_all_year1/price_import_year1/
-        # etc. non degrades/indexes -- meme dispatch, deterministe, que celui
-        # deja calcule ci-dessus pour decompose_gains/energy_report). Elimine
-        # la duplication de formule qui existait auparavant entre ce bloc et
-        # _dispatch_one_year (et le risque de divergence future associe).
-        rows.append(_dispatch_one_year(year, year_ctx))
-        label = "economie client" if mode_vente == "vente_directe" else "gain brut fournisseur"
-        valeur_log = rows[-1]['economie_client_eur'] if mode_vente == "vente_directe" else rows[-1]['gain_brut_fournisseur_eur']
-        print(f"  Annee {year:>2} : {label} = {valeur_log:>10,.0f} EUR")
-        if progress_callback:
-            progress_callback(year, horizon_annees)
+    # Annee 1 : passe par _dispatch_one_year comme toutes les autres annees
+    # (formule unique, pas de duplication), mais y reutilise le dispatch deja
+    # calcule ci-dessus (year1_dispatch) au lieu de le refaire a l'identique.
+    years = list(range(1, horizon_annees + 1))
+    parallel = _should_parallelize_years(parallel_years, dispatch_fn, p_max, e_max_year1, horizon_annees - 1)
+    if parallel:
+        print("  (annees calculees en parallele)")
+    rows_by_year = _dispatch_years(
+        years, year_ctx, parallel,
+        on_year_done=(lambda n: progress_callback(n, horizon_annees)) if progress_callback else None)
+    rows = [rows_by_year[y] for y in years]
+    label = "economie client" if mode_vente == "vente_directe" else "gain brut fournisseur"
+    for row in rows:
+        valeur_log = row['economie_client_eur'] if mode_vente == "vente_directe" else row['gain_brut_fournisseur_eur']
+        print(f"  Annee {row['annee']:>2} : {label} = {valeur_log:>10,.0f} EUR")
 
     result = pd.DataFrame(rows).sort_values("annee").reset_index(drop=True)
 
