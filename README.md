@@ -2,8 +2,9 @@
 
 Interface web locale (Streamlit) pour le moteur d'analyse "fournisseur"
 (PV + batterie + dispatch Day-Ahead). L'utilisateur renseigne un
-formulaire, l'application effectue le calcul a partir du fichier Excel
-modele, et produit un rapport PDF, des graphiques et le detail annuel.
+formulaire (consommation, production PV, prix de marche, hypotheses),
+l'application effectue le calcul et produit un rapport PDF, des
+graphiques et le detail annuel.
 
 ## Installation et lancement
 
@@ -59,19 +60,34 @@ Windows).
 
 ## Utilisation
 
-1. Charger le fichier Excel modele (.xlsm) contenant les feuilles
-   "DONNEES ENERGIE" (consommation client) et "PVS" (profil de production
-   PV).
-2. Charger le fichier de prix Day-Ahead Belpex (.pkl, en EUR/kWh) si
-   disponible. A defaut, l'application fonctionne en mode demonstration
-   (prix simules) -- a ne pas utiliser pour un client reel.
-3. Ajuster les parametres (PV, batterie, prix, marges, hypotheses
+1. Renseigner la consommation du client : soit un releve CSV (horodatage +
+   valeur, pas de temps quelconque detecte automatiquement), soit un
+   profil-type integre mis a l'echelle sur une consommation annuelle
+   cible.
+2. Renseigner la production PV : profil fige integre (extrait au
+   prealable depuis l'Excel modele) ou recuperation en direct via
+   l'API PVGIS.
+3. En mode "Fournisseur principal", renseigner les prix Day-Ahead
+   Belpex : annee integree, fichier CSV personnel (horodatage + prix en
+   EUR/kWh), ou mode demonstration (prix simules -- a ne pas utiliser
+   pour un client reel).
+4. Ajuster les parametres (PV, batterie, prix, marges, hypotheses
    financieres).
-4. Lancer la simulation. Le calcul complet (jusqu'a 20 ans, dispatch
+5. Lancer la simulation. Le calcul complet (jusqu'a 20 ans, dispatch
    optimise jour par jour) peut prendre plusieurs minutes selon l'horizon
    choisi ; une barre de progression indique l'avancement.
-5. Consulter les resultats (indicateurs, graphiques, detail annuel).
-6. Generer et telecharger le rapport PDF et le CSV detaille.
+6. Consulter les resultats (indicateurs, graphiques, detail annuel).
+7. En mode "Fournisseur secondaire" uniquement : completer et generer la
+   "Fiche financiere" (financement par emprunt, loyer, maintenance,
+   certificats verts -- reproduit l'onglet Excel correspondant, champs
+   pre-remplis depuis la simulation).
+8. Generer et telecharger le rapport PDF et le CSV detaille.
+
+Le fichier Excel modele (.xlsm, feuilles "DONNEES ENERGIE" et "PVS")
+n'est pas charge depuis l'interface : il sert de source, une seule fois
+en amont, aux scripts `io_sources/extract_pv_from_excel.py` et
+`io_sources/extract_conso_profiles_from_excel.py` qui figent les profils
+utilises ensuite par l'application (voir "Structure du projet").
 
 ## Fichier Excel source
 
@@ -97,7 +113,7 @@ calcul et ne sont jamais reecrits dans le fichier source.
   - `fetch_belpex.py` -- recuperation des prix Belpex Day-Ahead (script a executer une fois par an)
   - `pv_pvgis.py` -- recuperation du profil PV via l'API PVGIS (alternative a l'Excel)
 - `reporting/` -- generation des rapports PDF
-  - `pdf_report.py` -- rapport PDF principal (modele fournisseur)
+  - `pdf_report.py` -- rapport PDF principal, adapte au mode de vente actif
   - `pdf_style.py` -- formatage et style ReportLab partages
 - `tests/` -- tests de non-regression (voir section "Tests")
 
