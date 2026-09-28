@@ -254,7 +254,10 @@ if use_belpex:
 
     if belpex_source == "upload":
         belpex_upload_file = st.file_uploader(
-            "Fichier .pkl (EUR/kWh, index datetime)", type=["pkl"])
+            "Fichier CSV de prix Day-Ahead (2 colonnes : horodatage + prix EUR/kWh)",
+            type=["csv"],
+            help="Format CSV (pas .pkl) : un fichier .pkl exécuterait du code Python arbitraire "
+                 "à la lecture s'il provient d'une source non fiable -- le CSV n'a pas ce risque.")
 
     if not _belpex_annees_dispo:
         st.caption(
@@ -582,11 +585,10 @@ if submitted:
     #     le moteur route automatiquement sur le tarif de reference dans ce cas) ---
     if belpex_source == "upload":
         if belpex_upload_file is None:
-            st.error("Choisis une annee integree ou charge un fichier .pkl pour les prix Belpex.")
+            st.error("Choisis une annee integree ou charge un fichier CSV pour les prix Belpex.")
             st.stop()
-        dayahead_path = os.path.join(WORKDIR, "belpex_upload.pkl")
-        with open(dayahead_path, "wb") as f:
-            f.write(belpex_upload_file.getbuffer())
+        from io_excel.dataextraction import read_dayahead_csv
+        dayahead_path = read_dayahead_csv(belpex_upload_file)
     elif belpex_source == "demo":
         dayahead_path = "__no_file__"  # force le mode demo dans load_dayahead_prices
     elif belpex_source == "auto":

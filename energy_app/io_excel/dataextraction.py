@@ -292,6 +292,54 @@ def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
     return pd.Series(conso_kwh, index=series.index, name="conso_kwh")
 
 
+def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
+                       value_col: str = None) -> pd.Series:
+    """
+    Lit une serie de prix Day-Ahead (Belpex) depuis un CSV simple, en
+    remplacement d'un upload .pkl -- pd.read_pickle sur un fichier fourni par
+    l'utilisateur peut executer du code Python arbitraire (deserialisation
+    non fiable), un CSV ne presente pas ce risque.
+
+    Format attendu : 2 colonnes -- un timestamp et un prix en EUR/kWh.
+    Detection automatique des noms de colonnes, du separateur (',' ou ';')
+    et du format decimal (point ou virgule), meme logique que read_conso_csv.
+
+    Retourne une pd.Series indexee par datetime (naive), prix en EUR/kWh, au
+    pas de temps natif du CSV (le calage sur les dates client se fait plus
+    loin par _align_market_price_to_calendar, quel que soit ce pas).
+    """
+    df = _read_csv_robuste(csv_path_or_buffer)
+
+    if timestamp_col is None:
+        candidates = ["timestamp", "datetime", "date", "date/heure", "date_heure"]
+        timestamp_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[0])
+    if value_col is None:
+        candidates = ["prix", "price", "value", "valeur", "eur_kwh", "eur/kwh", "prix_eur_kwh"]
+        value_col = next((c for c in df.columns if c.strip().lower() in candidates), df.columns[1])
+
+    ts = pd.to_datetime(df[timestamp_col], dayfirst=True)
+    values = df[value_col].apply(_parse_decimal_str)
+    n_bad = int(values.isna().sum())
+    if n_bad:
+        print(f"  /!\\ {n_bad} prix Day-Ahead illisibles dans le CSV -- ignores. "
+              f"Verifie le format de la colonne '{value_col}' si ce nombre est eleve.")
+
+    series = pd.Series(values.values, index=pd.DatetimeIndex(ts), name="price_eur_kwh")
+    series = series.dropna()
+    series = series[~series.index.duplicated(keep="first")].sort_index()
+
+    if len(series) < 2:
+        raise ValueError("CSV Day-Ahead : pas assez de lignes valides pour construire la serie.")
+
+    med = float(np.nanmedian(np.abs(series.values)))
+    if med > 2.0:
+        print(f"  /!\\ ATTENTION UNITES : la mediane des prix chargee est {med:.1f} -- "
+              f"ca ressemble a des EUR/MWh, pas des EUR/kWh (colonne '{value_col}').")
+
+    print(f"  -> CSV Day-Ahead : {len(series)} points, de {series.index[0]} a {series.index[-1]}")
+    return series
+
+
 def align_conso_to_quarter_hour(conso_kwh: pd.Series) -> pd.Series:
     """
     Ramene une serie de conso (kWh par pas de temps, pas quelconque) a une
