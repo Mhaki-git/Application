@@ -12,6 +12,7 @@ from scipy.optimize import linprog
 
 from io_excel.dataextraction import extract_all, XLSM_PATH as DEFAULT_XLSM_PATH
 from engine.finance_utils import compute_npv_irr
+from engine.calendar_utils import NearestByCalendarSymmetry
 
 import sys
 
@@ -64,6 +65,73 @@ def _build_lp_skeleton(n: int):
 _LP_SKELETON = _build_lp_skeleton(STEPS_PER_DAY)
 
 
+def _align_market_price_to_calendar(market_price: pd.Series, target_index: pd.DatetimeIndex) -> pd.Series:
+    """
+    Aligne une serie de prix Day-Ahead (indexee sur son annee source, ex.
+    2024 ou 2025 -- eventuellement une simple TRANCHE de l'annee, ex. 1er
+    janvier -> 15 aout, si l'utilisateur a choisi de limiter la source) sur
+    target_index (les dates REELLES du client, qui peuvent demarrer
+    n'importe quand -- ex. 02/03/2025), en calant par (mois, jour, heure)
+    plutot que par timestamp exact.
+
+    Sans ca, un reindex() direct sur des annees differentes ne matcherait
+    quasiment aucun timestamp (source et cible n'ont pas la meme annee) et
+    retomberait en NaN -> ffill/bfill, aplatissant le prix sur toute la
+    periode au lieu de suivre le vrai profil journalier/saisonnier Belpex.
+
+    Calage volontairement fait au niveau de l'HEURE (pas la minute) : la
+    source Day-Ahead reelle (fetch_belpex.py, format natif ENTSO-E) est
+    HORAIRE, pas quart-horaire, malgre le suffixe "_qh" du nom de fichier --
+    caler sur (mois, jour, heure, minute) exact ferait manquer les cibles a
+    :15/:30/:45 (aucune source a ces minutes) et les ferait retomber sur un
+    mauvais fallback. Tous les quarts d'heure d'une meme heure recoivent donc
+    le meme prix horaire, comme le faisait l'ancien reindex(...,method=ffill),
+    que la source soit horaire ou deja quart-horaire (dans ce dernier cas, on
+    ecrase juste par une moyenne des 4 valeurs -- v. groupby ci-dessous).
+
+    Si l'heure cible n'a pas d'exacte correspondance dans la source (29
+    fevrier absent d'une annee non bissextile, ou jour hors de la tranche
+    source retenue) : repli sur le jour disponible le plus proche en
+    distance calendaire CYCLIQUE, a la meme heure -- meme logique que
+    dataextraction.fill_missing_periods_by_calendar_symmetry.
+    """
+    # Une source deja quart-horaire (4 valeurs/heure, potentiellement
+    # differentes) est reduite a une valeur par heure (moyenne) pour que le
+    # calage joue toujours au meme niveau de granularite, quelle que soit la
+    # resolution native de la source.
+    hourly = market_price.groupby(
+        [market_price.index.month, market_price.index.day, market_price.index.hour]
+    ).mean()
+    hourly.index.names = ["month", "day", "hour"]
+
+    exact_lookup = {}
+    calendar_index = NearestByCalendarSymmetry()
+    for (month, day, hour), val in hourly.items():
+        exact_lookup[(month, day, hour)] = val
+        calendar_index.add(subkey=hour, month=month, day=day, value=val)
+    calendar_index.finalize()
+
+    fallback = float(np.nanmean(hourly.values))
+
+    out_values = np.empty(len(target_index))
+    n_fallback = 0
+    for i, ts in enumerate(target_index):
+        key = (ts.month, ts.day, ts.hour)
+        if key in exact_lookup:
+            out_values[i] = exact_lookup[key]
+        else:
+            out_values[i] = calendar_index.closest(
+                subkey=ts.hour, month=ts.month, day=ts.day, fallback=fallback)
+            n_fallback += 1
+
+    if n_fallback:
+        print(f"  /!\\ {n_fallback} pas de temps sans correspondance exacte (heure) dans la "
+              f"source Day-Ahead (29 fevrier, ou jour hors de la tranche source retenue) -- "
+              f"combles par le jour disponible le plus proche (symetrie calendaire).")
+
+    return pd.Series(out_values, index=target_index)
+
+
 def load_dayahead_prices(dayahead_pkl_path, target_index: pd.DatetimeIndex) -> tuple:
     try:
         if not dayahead_pkl_path:
@@ -72,7 +140,8 @@ def load_dayahead_prices(dayahead_pkl_path, target_index: pd.DatetimeIndex) -> t
         if market_price.index.tz is not None:
             market_price = market_price.tz_localize(None)
         market_price = market_price[~market_price.index.duplicated(keep="first")]
-        market_price = market_price.reindex(target_index, method="ffill")
+
+        market_price = _align_market_price_to_calendar(market_price, target_index)
         n_nan = int(market_price.isna().sum())
         if n_nan:
             print(f"  /!\\ {n_nan} prix Day-Ahead manquants (NaN) dans '{dayahead_pkl_path}' "
@@ -474,6 +543,23 @@ def client_old_cost(conso_all: np.ndarray, hour_all: np.ndarray, params: dict,
     return energy_cost + params["old_cout_additionnel_contrat"] + demand_charge
 
 
+def demand_charge_rate_for_mode(mode_vente: str, tarif_capacitaire_fournisseur: float) -> float:
+    """
+    Tarif capacitaire (peak shaving) a appliquer au dispatch, selon le mode
+    de vente. Retire (0.0) UNIQUEMENT en mode "fournisseur_secondaire"
+    (demande utilisateur) : annule a la fois son cout (dont_pointe_eur) et
+    l'incitation d'ecretement de pointe dans le LP (c[6*N] dans
+    solve_day_dispatch) pour ce mode-la seulement -- les autres modes
+    (fournisseur_principal, vente_directe) gardent le tarif capacitaire
+    normalement, tout comme client_old_cost.
+
+    Regle centralisee ici (au lieu de dupliquee dans _run_fournisseur_model_impl
+    et _dispatch_one_year) pour qu'une evolution future de cette regle metier
+    n'ait qu'un seul endroit a modifier.
+    """
+    return 0.0 if mode_vente == "fournisseur_secondaire" else tarif_capacitaire_fournisseur
+
+
 def prix_vente_annee(prix_base: float, year: int, revision_pct: float = 0.0,
                       periode_revision_annees: int = 5) -> float:
     if revision_pct == 0.0 or periode_revision_annees is None:
@@ -637,13 +723,8 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
     e_max_year = e_max_year1 * ((1 - degr_batt) ** age_batterie)
 
     inflation_factor = (1 + inflation) ** (year - 1)
-    # Tarif capacitaire retire du calcul du gain UNIQUEMENT en mode
-    # "fournisseur_secondaire" (demande utilisateur) -- voir la meme regle
-    # dans _run_fournisseur_model_impl.
-    demand_charge_year = (
-        0.0 if params.get("mode_vente") == "fournisseur_secondaire"
-        else params["tarif_capacitaire_fournisseur"] * inflation_factor
-    )
+    demand_charge_year = demand_charge_rate_for_mode(
+        params.get("mode_vente"), params["tarif_capacitaire_fournisseur"]) * inflation_factor
     maintenance_year = params["maintenance_eur_an"] * inflation_factor
 
     if use_belpex:
@@ -754,10 +835,22 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
     # plafonne donc chaque pas de temps a kva_onduleur * DT (kWh max par
     # intervalle), AVANT que la production n'entre dans le dispatch -- cette
     # energie est perdue, elle ne peut ni etre autoconsommee, ni stockee, ni
-    # injectee. Approximation kVA ~= kW (facteur de puissance ~1, standard
-    # pour ce type de modele). Comme la degradation PV annee par annee ne fait
-    # que reduire la production (jamais l'augmenter), un seul ecretement ici
-    # suffit pour tout l'horizon (voir _dispatch_one_year : pv_year = pv_all_year1 * degr).
+    # injectee. Comme la degradation PV annee par annee ne fait que reduire
+    # la production (jamais l'augmenter), un seul ecretement ici suffit pour
+    # tout l'horizon (voir _dispatch_one_year : pv_year = pv_all_year1 * degr).
+    #
+    # /!\ APPROXIMATION VOLONTAIRE : kva_onduleur (kVA, puissance APPARENTE)
+    # est utilise directement comme une puissance ACTIVE en kW, ce qui revient
+    # a supposer un facteur de puissance (cos phi) egal a 1. C'est une
+    # simplification standard pour ce type de modele, correcte pour la
+    # grande majorite des onduleurs PV (cos phi proche de 1 en fonctionnement
+    # normal). Si l'onduleur reel impose une limitation de puissance reactive
+    # notable (cos phi < 1 impose par le gestionnaire de reseau, par exemple),
+    # la puissance active reellement disponible est LEGEREMENT INFERIEURE a
+    # kva_onduleur, et l'ecretement calcule ici sous-estime alors (un peu) la
+    # perte de production reelle. Pas de parametre facteur de puissance
+    # separe pour l'instant (choix produit : garder le modele simple) --
+    # a garder en tete si un client a un onduleur avec cos phi impose bas.
     kva_onduleur = params.get("kva_onduleur") or 0.0
     if kva_onduleur > 0:
         pv_cap_kwh_per_step = kva_onduleur * DT
@@ -765,7 +858,8 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
         pv_clip_onduleur_kwh = float((pv_all_year1_raw - pv_all_year1).sum())
         if pv_clip_onduleur_kwh > 0:
             print(f"  /!\\ Ecretement onduleur : {pv_clip_onduleur_kwh:,.0f} kWh/an de production PV "
-                  f"perdue car superieure a la puissance de l'onduleur ({kva_onduleur:.1f} kVA).")
+                  f"perdue car superieure a la puissance de l'onduleur ({kva_onduleur:.1f} kVA, "
+                  f"approximation cos phi = 1 -- voir commentaire dans le code).")
     else:
         pv_all_year1 = pv_all_year1_raw
         pv_clip_onduleur_kwh = 0.0
@@ -793,16 +887,7 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
     p_max = params["battery_power_kw"]
     e_max_year1 = params["battery_capacity_kwh"]
     contrat_kw = params["contrat_kw"]
-    # Tarif capacitaire retire du calcul du gain UNIQUEMENT en mode
-    # "fournisseur_secondaire" (demande utilisateur) : annule a la fois son
-    # cout (dont_pointe_eur) et l'incitation d'ecretement de pointe dans le LP
-    # (c[6*N] dans solve_day_dispatch) pour ce mode-la seulement -- les autres
-    # modes (fournisseur_principal, vente_directe) gardent le tarif capacitaire
-    # normalement, tout comme client_old_cost.
-    demand_charge_rate = (
-        0.0 if mode_vente == "fournisseur_secondaire"
-        else params["tarif_capacitaire_fournisseur"]
-    )
+    demand_charge_rate = demand_charge_rate_for_mode(mode_vente, params["tarif_capacitaire_fournisseur"])
     inflation = params["inflation_pct"] / 100.0
     degr_pv = params["degradation_pv_pct"] / 100.0
     degr_batt = params["degradation_batterie_pct"] / 100.0
@@ -896,35 +981,13 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
 
     rows = []
     for year in range(1, horizon_annees + 1):
-        if year == 1 and annee_remplacement_batterie != 1:
-            maintenance_year1 = params["maintenance_eur_an"]
-            if mode_vente == "fournisseur_secondaire":
-                # Pas de cout d'energie/frais fixes reseau ici : tu ne vends
-                # que la production PV (encaissee dans revenue_client_year1),
-                # tes seuls couts sont la maintenance et le tarif capacitaire.
-                cout_appro_y1 = demand_charge_y1 + maintenance_year1
-            else:
-                cout_appro_y1 = energy_cost_y1 + demand_charge_y1 + maintenance_year1 + params["old_cout_additionnel_contrat"]
-            rows.append({
-                "annee": 1,
-                "revenu_client_eur": revenue_client_year1,
-                "cout_approvisionnement_eur": cout_appro_y1,
-                "dont_energie_eur": 0.0 if mode_vente == "fournisseur_secondaire" else energy_cost_y1,
-                "dont_pointe_eur": demand_charge_y1,
-                "dont_maintenance_eur": maintenance_year1,
-                "dont_remplacement_batterie_eur": 0.0,
-                "gain_brut_fournisseur_eur": revenue_client_year1 - cout_appro_y1,
-                "ancien_cout_client_indexe_eur": old_cost_year1,
-                "economie_client_eur": (
-                    old_cost_year1 - cout_appro_y1 if mode_vente == "vente_directe"
-                    else old_cost_year1 - revenue_client_year1
-                ),
-                "import_reseau_kwh": import_y1,
-                "export_reseau_kwh": export_y1,
-                "curtail_pv_kwh": curtail_y1,
-            })
-        else:
-            rows.append(_dispatch_one_year(year, year_ctx))
+        # Annee 1 : passe par _dispatch_one_year comme toutes les autres
+        # annees (year=1 y redonne exactement pv_all_year1/price_import_year1/
+        # etc. non degrades/indexes -- meme dispatch, deterministe, que celui
+        # deja calcule ci-dessus pour decompose_gains/energy_report). Elimine
+        # la duplication de formule qui existait auparavant entre ce bloc et
+        # _dispatch_one_year (et le risque de divergence future associe).
+        rows.append(_dispatch_one_year(year, year_ctx))
         label = "economie client" if mode_vente == "vente_directe" else "gain brut fournisseur"
         valeur_log = rows[-1]['economie_client_eur'] if mode_vente == "vente_directe" else rows[-1]['gain_brut_fournisseur_eur']
         print(f"  Annee {year:>2} : {label} = {valeur_log:>10,.0f} EUR")

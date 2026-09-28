@@ -4,12 +4,23 @@ Extraction DYNAMIQUE des donnees et parametres depuis le fichier Excel.
 Principe : RIEN n'est fige en dur dans le code. A chaque execution, on relit
 l'Excel tel qu'il est *maintenant*. Si tu changes une valeur dans le fichier
 et relances le script, tout est recalcule automatiquement.
+
+STATUT : `extract_all` (et ses dependances `_read_parameters`,
+`_read_conso_series`, `_read_pv_series`) constituent le chemin "legacy Excel"
+-- lecture complete d'un .xlsm (parametres + series temporelles). L'UI
+Streamlit actuelle (app.py) NE PASSE PLUS par ce chemin : elle utilise
+`build_timeseries_from_sources` (CSV/profil integre + PVGIS/PV fige) et
+passe les parametres directement en dict. `extract_all` reste utilise par
+`engine.fournisseur_roi.run_fournisseur_model` (point d'entree CLI/scripts,
+non appele par app.py) et par les tests de non-regression. Conserve pour
+compatibilite descendante, pas le flux de production.
 """
 import openpyxl
 import pandas as pd
 import numpy as np
 
 from io_excel.excel_schema import PARAM_CELL_MAP, PARAMETERS_SHEET_NAME
+from engine.calendar_utils import NearestByCalendarSymmetry
 
 XLSM_PATH = "ENERGY MIX ANALYSIS - AMELIORATION (2).xlsm"
 
@@ -314,12 +325,116 @@ def align_conso_to_quarter_hour(conso_kwh: pd.Series) -> pd.Series:
     return result
 
 
-def build_timeseries_from_sources(conso_csv_path_or_buffer, pv_hourly_profile_1kwc: pd.Series,
+def fill_missing_periods_by_calendar_symmetry(conso_kwh: pd.Series, step_minutes: int = 15) -> tuple:
+    """
+    Complete un releve de consommation incomplet -- que ce soit un trou interne
+    (ex: une semaine ou un mois manquant au milieu de l'annee) ou une periode
+    couverte plus courte qu'une annee complete (ex: un releve qui ne va que
+    de janvier a septembre) -- en reconstituant une grille reguliere complete
+    sur l'ANNEE CIVILE de la premiere date du releve (1er janvier -> 31
+    decembre), au pas de temps `step_minutes`.
+
+    Principe (symetrie calendaire) : pour chaque quart d'heure manquant, on
+    prend la valeur du jour disponible le plus proche en distance calendaire
+    CYCLIQUE (nombre de jours sur une annee de 365, sans distinction
+    avant/apres), a la meme heure/minute -- ex. s'il manque la 2e moitie de
+    l'automne, elle est completee avec les jours de la 1ere moitie d'automne
+    les plus proches (ou, a defaut, les jours equivalents une saison plus
+    loin), pas avec une valeur d'hiver ou d'ete qui n'aurait pas de sens.
+
+    Meme regle qu'il s'agisse d'un trou en debut/fin de periode ou d'un trou
+    interne : la grille cible est toujours l'annee civile complete. Si le
+    releve depasse cette annee civile (ex: 14 mois, a cheval sur 2 annees),
+    l'exces est tronque -- le moteur de simulation tourne toujours sur un
+    horizon d'exactement 1 an.
+
+    Retourne (serie_completee, n_points_tronques) : n_points_tronques est le
+    nombre de pas de temps du releve original qui tombaient hors de l'annee
+    civile retenue (0 si le releve ne depassait pas 12 mois).
+    """
+    if len(conso_kwh) < 2:
+        return conso_kwh, 0
+
+    year = conso_kwh.index[0].year
+    full_index = pd.date_range(
+        pd.Timestamp(year=year, month=1, day=1),
+        pd.Timestamp(year=year, month=12, day=31, hour=23, minute=60 - step_minutes),
+        freq=f"{step_minutes}min")
+
+    in_year_mask = (conso_kwh.index >= full_index[0]) & (conso_kwh.index <= full_index[-1])
+    n_truncated = int((~in_year_mask).sum())
+    if n_truncated:
+        conso_kwh = conso_kwh[in_year_mask]
+        print(f"  /!\\ {n_truncated} pas de temps du releve tombent hors de l'annee civile "
+              f"{year} (releve de plus de 12 mois) -- tronques, la simulation tourne sur "
+              f"exactement 1 an ({year}).")
+
+    missing_mask = ~full_index.isin(conso_kwh.index)
+    n_missing = int(missing_mask.sum())
+    if n_missing == 0:
+        return conso_kwh, n_truncated
+
+    # Index (heure, minute) -> jour le plus proche disponible (distance
+    # calendaire cyclique) -- voir engine/calendar_utils.py, partage avec
+    # l'alignement des prix Day-Ahead (engine/fournisseur_roi.py).
+    calendar_index = NearestByCalendarSymmetry()
+    for ts, val in conso_kwh.items():
+        calendar_index.add(subkey=(ts.hour, ts.minute), month=ts.month, day=ts.day, value=val)
+    calendar_index.finalize()
+
+    fallback_mean = float(conso_kwh.mean())
+
+    def _closest_value(ts) -> float:
+        return calendar_index.closest(
+            subkey=(ts.hour, ts.minute), month=ts.month, day=ts.day, fallback=fallback_mean)
+
+    filled_values = []
+    existing = conso_kwh.to_dict()
+    n_filled = 0
+    for ts in full_index:
+        if ts in existing:
+            filled_values.append(existing[ts])
+        else:
+            filled_values.append(_closest_value(ts))
+            n_filled += 1
+
+    print(f"  /!\\ {n_filled} pas de temps manquants dans le releve de consommation "
+          f"({n_filled * step_minutes / 60:.0f} h au total) -- completes par symetrie "
+          f"calendaire (jour disponible le plus proche, meme heure, meme rythme "
+          f"hebdomadaire pas garanti).")
+
+    filled_series = pd.Series(filled_values, index=full_index, name=conso_kwh.name or "conso_kwh")
+    return filled_series, n_truncated
+
+
+def conso_from_normalized_profile(profile: pd.Series, conso_annuelle_kwh: float) -> pd.Series:
+    """
+    Met a l'echelle un profil de consommation normalise (fraction de l'annee
+    par quart d'heure, somme = 1.0 -- voir io_sources/extract_conso_profiles_from_excel.py)
+    avec une consommation annuelle cible, pour obtenir une serie en kWh par
+    quart d'heure directement utilisable par le reste du pipeline.
+    """
+    if conso_annuelle_kwh < 0:
+        raise ValueError("La consommation annuelle cible doit etre positive ou nulle.")
+    if len(profile) < 2:
+        raise ValueError(
+            f"Profil de consommation vide ou trop court ({len(profile)} point(s)) -- "
+            f"verifie data/conso_profiles.pkl (le regenerer si besoin via "
+            f"io_sources/extract_conso_profiles_from_excel.py)."
+        )
+    series = profile * conso_annuelle_kwh
+    series.name = "conso_kwh"
+    return series
+
+
+def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: pd.Series,
                                     kwc: float, unit: str = "kW") -> pd.DataFrame:
     """
     Construit le DataFrame (conso_kwh, pv_kwh, hour, is_weekend) attendu par
     le moteur de dispatch (fournisseur_roi.py), a partir :
-    - d'un CSV de consommation client (voir read_conso_csv)
+    - d'une consommation client : soit un CSV (chemin/buffer, voir
+      read_conso_csv), soit une pd.Series deja en kWh par quart d'heure
+      (ex: un profil integre mis a l'echelle via conso_from_normalized_profile)
     - d'un profil PV PVGIS pour 1 kWc (voir pv_pvgis.fetch_pv_profile_1kwc)
 
     C'est le remplacement direct de extract_all() pour la nouvelle interface
@@ -328,9 +443,15 @@ def build_timeseries_from_sources(conso_csv_path_or_buffer, pv_hourly_profile_1k
     """
     from io_sources.pv_pvgis import expand_to_quarter_hour
 
-    print("Lecture de la consommation client (CSV)...")
-    conso_raw = read_conso_csv(conso_csv_path_or_buffer, unit=unit)
-    conso_qh = align_conso_to_quarter_hour(conso_raw)
+    n_truncated = 0
+    if isinstance(conso_series_or_csv, pd.Series):
+        print("Consommation client : profil integre deja en kWh/quart d'heure.")
+        conso_qh = align_conso_to_quarter_hour(conso_series_or_csv)
+    else:
+        print("Lecture de la consommation client (CSV)...")
+        conso_raw = read_conso_csv(conso_series_or_csv, unit=unit)
+        conso_qh = align_conso_to_quarter_hour(conso_raw)
+        conso_qh, n_truncated = fill_missing_periods_by_calendar_symmetry(conso_qh)
 
     print("Alignement du profil PV (PVGIS) sur la grille quart-horaire du client...")
     pv_qh = expand_to_quarter_hour(pv_hourly_profile_1kwc, kwc=kwc, target_index=conso_qh.index)
@@ -344,6 +465,7 @@ def build_timeseries_from_sources(conso_csv_path_or_buffer, pv_hourly_profile_1k
 
     print(f"  -> Serie finale : {len(df)} points, conso={df['conso_kwh'].sum():,.0f} kWh/an, "
           f"pv={df['pv_kwh'].sum():,.0f} kWh/an")
+    df.attrs["n_truncated_qh"] = n_truncated
     return df
 
 
