@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 from io_excel.dataextraction import build_timeseries_from_sources
 from engine.fournisseur_roi import run_fournisseur_model_from_data
 from reporting.pdf_report import build_pdf_report
+from reporting.pdf_style import fmt_eur, fmt_number
 
 st.set_page_config(page_title="Analyse Energetique - PV & Batterie", layout="wide", page_icon="⚡")
 
@@ -70,13 +71,76 @@ use_belpex = (mode == "fournisseur_principal")
 st.header("1. Données du site")
 
 col1, col2 = st.columns(2)
+CONSO_PROFILES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conso_profiles.pkl")
+CONSO_PROFILE_LABELS = {
+    "residentiel_famille_enfants_scolarises": "Résidentiel - Famille avec enfants scolarisés",
+    "residentiel_famille_jeunes_enfants": "Résidentiel - Famille avec jeunes enfants",
+    "residentiel_menage_1_2_personnes": "Résidentiel - Ménage avec 1 ou 2 personnes",
+    "residentiel_retraites_ou_domicile": "Résidentiel - Retraités ou travail à domicile",
+    "residentiel_conso_concentree_nuit": "Résidentiel - Consommation concentrée la nuit",
+    "industriel_conso_constante": "Industriel - Consommation d'énergie constante",
+    "industriel_conso_soiree": "Industriel - Consommation d'énergie en soirée",
+    "industriel_semaine_conso": "Industriel - En semaine, axé sur la consommation",
+    "industriel_commerce_heures_ouverture": "Industriel - Commerce (heures d'ouverture)",
+}
+
+
+@st.cache_data
+def _load_conso_profiles(path: str):
+    return pd.read_pickle(path)
+
+
 with col1:
     st.subheader("Consommation client")
-    conso_file = st.file_uploader(
-        "CSV de consommation (2 colonnes : horodatage + valeur). "
-        "Pas de temps quelconque (15/30/60 min), detecte automatiquement.",
-        type=["csv"])
-    conso_unit = st.radio("Unite de la colonne valeur", options=["kW", "kWh"], horizontal=True)
+    conso_source = st.radio(
+        "Source de la consommation",
+        options=["upload", "profil_integre"],
+        format_func=lambda x: (
+            "Uploader un CSV de consommation" if x == "upload"
+            else "Choisir un profil-type intégré (quart-horaire)"
+        ),
+        horizontal=True,
+    )
+
+    conso_file = None
+    conso_unit = "kW"
+    conso_series_profile = None
+
+    if conso_source == "upload":
+        conso_file = st.file_uploader(
+            "CSV de consommation (2 colonnes : horodatage + valeur). "
+            "Pas de temps quelconque (15/30/60 min), detecte automatiquement.",
+            type=["csv"])
+        conso_unit = st.radio("Unite de la colonne valeur", options=["kW", "kWh"], horizontal=True)
+    else:
+        if os.path.exists(CONSO_PROFILES_PATH):
+            conso_profiles = _load_conso_profiles(CONSO_PROFILES_PATH)
+            _profile_keys = list(conso_profiles.keys())
+            profile_key = st.selectbox(
+                "Profil-type de consommation",
+                options=_profile_keys,
+                format_func=lambda k: CONSO_PROFILE_LABELS.get(k, k),
+            )
+            conso_annuelle_kwh = st.number_input(
+                "Consommation annuelle cible (kWh/an)",
+                value=100000.0, step=1000.0, min_value=0.0,
+                help="Le profil intégré est une forme normalisée (répartition quart-horaire sur "
+                     "l'année) -- il est mis à l'échelle avec cette valeur pour obtenir la "
+                     "consommation réelle en kWh.",
+            )
+            from io_excel.dataextraction import conso_from_normalized_profile
+            conso_series_profile = conso_from_normalized_profile(
+                conso_profiles[profile_key], conso_annuelle_kwh)
+            st.success(
+                f"Profil '{CONSO_PROFILE_LABELS.get(profile_key, profile_key)}' chargé, "
+                f"mis à l'échelle sur {fmt_number(conso_annuelle_kwh, suffix='kWh/an')}"
+            )
+        else:
+            st.error(
+                "Aucun profil de consommation intégré trouvé (`data/conso_profiles.pkl`). "
+                "Lance `python io_sources/extract_conso_profiles_from_excel.py <fichier.xlsm>` "
+                "une fois, ou choisis l'upload CSV ci-dessus."
+            )
 
 with col2:
     st.subheader("Production PV")
@@ -97,7 +161,7 @@ with col2:
             pv_profile_1kwc = _load_pv_profile_1kwc(PV_PROFILE_PATH)
             st.success(
                 f"Profil PV charge depuis l'Excel (fige) : "
-                f"{pv_profile_1kwc.sum():,.0f} kWh/kWc/an".replace(",", " ")
+                f"{fmt_number(pv_profile_1kwc.sum(), suffix='kWh/kWc/an')}"
             )
             st.caption(
                 "Ce profil vient de `data/pv_profile_1kwc.pkl`. Pour le changer "
@@ -133,7 +197,7 @@ with col2:
                 pv_profile_1kwc = _fetch_pv_pvgis(pv_lat, pv_lon, pv_tilt, pv_azimuth, pv_loss)
             st.success(
                 f"Profil PV recupere via PVGIS : "
-                f"{pv_profile_1kwc.sum():,.0f} kWh/kWc/an".replace(",", " ")
+                f"{fmt_number(pv_profile_1kwc.sum(), suffix='kWh/kWc/an')}"
             )
         except Exception as e:
             st.error(f"Erreur lors de l'appel PVGIS : {e}")
@@ -149,17 +213,44 @@ if use_belpex:
         if f.startswith("belpex_") and f.endswith("_qh.pkl")
     ]) if os.path.isdir(BELPEX_DATA_DIR) else []
 
-    belpex_options = _belpex_annees_dispo + ["upload", "demo"]
+    belpex_options = (["auto"] if _belpex_annees_dispo else []) + _belpex_annees_dispo + ["upload", "demo"]
     belpex_source = st.radio(
         "Source des prix Day-Ahead",
         options=belpex_options,
         format_func=lambda x: (
-            f"Annee {x} (integree)" if x not in ("upload", "demo") else
+            "Auto (suit les dates réelles de la consommation client)" if x == "auto" else
+            f"Annee {x} (integree, forcée)" if x not in ("upload", "demo") else
             "Uploader mon propre fichier .pkl" if x == "upload" else
             "Mode demo (prix simules -- a eviter pour un vrai client)"
         ),
         horizontal=True,
     )
+    belpex_date_fin = None
+    if belpex_source == "auto":
+        st.caption(
+            "Le prix Day-Ahead est calé jour par jour (mois/jour/heure) sur les dates de la "
+            "consommation client -- l'année Belpex intégrée la plus proche est choisie "
+            "automatiquement (celle qui correspond si elle existe, sinon la plus récente)."
+        )
+    elif belpex_source not in ("upload", "demo"):
+        st.caption(
+            f"Prix Day-Ahead : année '{belpex_source}' forcée (calée jour par jour sur les "
+            f"dates de la consommation client, quelle que soit leur vraie année)."
+        )
+        _limiter_periode = st.checkbox(
+            f"Limiter la source à une tranche du 1er janvier {belpex_source} à une date de fin",
+            value=False,
+            help="Si le reste de l'année source n'est pas jugé pertinent ou fiable (ex: données "
+                 "incomplètes après une certaine date), le calage jour/mois/heure n'utilisera "
+                 "que les prix Belpex de cette tranche.",
+        )
+        if _limiter_periode:
+            belpex_date_fin = st.date_input(
+                f"Date de fin de la tranche (1er janvier {belpex_source} -> cette date)",
+                value=datetime.date(int(belpex_source), 12, 31),
+                min_value=datetime.date(int(belpex_source), 1, 1),
+                max_value=datetime.date(int(belpex_source), 12, 31),
+            )
 
     if belpex_source == "upload":
         belpex_upload_file = st.file_uploader(
@@ -176,8 +267,8 @@ else:
         "s'appuie directement sur le tarif reseau (fixe ou HP/HC) defini ci-dessous."
     )
 
-if conso_file is None:
-    st.info("Charge d'abord le CSV de consommation du client pour continuer.")
+if conso_file is None and conso_series_profile is None:
+    st.info("Charge un CSV de consommation ou choisis un profil intégré pour continuer.")
     st.stop()
 
 if pv_profile_1kwc is None:
@@ -227,6 +318,7 @@ else:
 c1.caption(
     f"Onduleur : **{kva_onduleur:.1f} kVA**"
     + (" (catalogue)" if pv_input_mode == "catalogue" else " (règle kWc / 1.5)")
+    + " -- l'écrêtement de production suppose un facteur de puissance (cos φ) = 1 (kVA ≈ kW)."
 )
 
 battery_power_kw = c2.number_input("Puissance batterie (kW)", value=0.0, step=1.0)
@@ -236,50 +328,31 @@ has_battery = (battery_power_kw > 0) and (battery_capacity_kwh > 0)
 
 
 @st.cache_data(show_spinner=False)
-def _build_preview_timeseries(conso_bytes: bytes, pv_profile: pd.Series, kwc_val: float, unit_val: str):
+def _build_preview_timeseries_csv(conso_bytes: bytes, pv_profile: pd.Series, kwc_val: float, unit_val: str):
     import io
     buf = io.BytesIO(conso_bytes)
     return build_timeseries_from_sources(buf, pv_profile, kwc=kwc_val, unit=unit_val)
 
 
 @st.cache_data(show_spinner=False)
+def _build_preview_timeseries_profile(conso_series: pd.Series, pv_profile: pd.Series, kwc_val: float):
+    return build_timeseries_from_sources(conso_series, pv_profile, kwc=kwc_val)
+
+
+@st.cache_data(show_spinner=False)
 def _simulate_battery_selfconso(pv_kwh: np.ndarray, conso_kwh: np.ndarray,
                                  battery_power_kw: float, battery_capacity_kwh: float):
-    """
-    Dispatch glouton (maximisation autoconsommation instantanee, PAS d'arbitrage
-    Belpex/day-ahead) : a chaque quart d'heure, le surplus PV charge la batterie
-    (dans la limite de sa puissance et de sa capacite), le deficit est couvert
-    par la batterie si elle a de l'energie disponible. Volontairement plus
-    simple/rapide que le vrai dispatch LP (fournisseur_roi.run_year_dispatch) --
-    sert uniquement a donner un ordre de grandeur dans l'apercu instantane,
-    avant de lancer la simulation complete (qui reste la seule source fiable
-    pour le ROI/gain reel, car elle optimise aussi sur le prix de marche).
-    """
-    dt = 0.25  # kWh par pas de temps pour 1 kW sur un quart d'heure
-    p_max_kwh = battery_power_kw * dt
-    soc = 0.0
-    n = len(pv_kwh)
-    import_kwh = np.empty(n)
-    export_kwh = np.empty(n)
-    for i in range(n):
-        surplus = pv_kwh[i] - conso_kwh[i]
-        if surplus >= 0:
-            charge = min(surplus, p_max_kwh, battery_capacity_kwh - soc)
-            soc += charge
-            export_kwh[i] = surplus - charge
-            import_kwh[i] = 0.0
-        else:
-            deficit = -surplus
-            decharge = min(deficit, p_max_kwh, soc)
-            soc -= decharge
-            import_kwh[i] = deficit - decharge
-            export_kwh[i] = 0.0
-    return import_kwh, export_kwh
+    """Cache Streamlit autour de engine.preview_dispatch.simulate_battery_selfconso (voir ce module)."""
+    from engine.preview_dispatch import simulate_battery_selfconso
+    return simulate_battery_selfconso(pv_kwh, conso_kwh, battery_power_kw, battery_capacity_kwh)
 
 
 _live_pvm = None
 try:
-    _df_preview = _build_preview_timeseries(conso_file.getvalue(), pv_profile_1kwc, kwc, conso_unit)
+    if conso_series_profile is not None:
+        _df_preview = _build_preview_timeseries_profile(conso_series_profile, pv_profile_1kwc, kwc)
+    else:
+        _df_preview = _build_preview_timeseries_csv(conso_file.getvalue(), pv_profile_1kwc, kwc, conso_unit)
     _pv_kwh_prev = _df_preview["pv_kwh"].values
     if kva_onduleur > 0:
         _pv_kwh_prev = np.minimum(_pv_kwh_prev, kva_onduleur * 0.25)
@@ -312,19 +385,20 @@ try:
         "pv_total": _pv_total_prev, "conso_total": _conso_total_prev,
         "export": _export_prev, "autoconso_pct": _autoconso_prev, "autonomie_pct": _autonomie_prev,
     }
-except Exception:
+except Exception as _e:
     _live_pvm = None
+    st.caption(f"ℹ️ Aperçu instantané indisponible pour l'instant ({_e}).")
 
 if _live_pvm:
     if has_battery:
         st.caption(
             f"📊 Aperçu instantané AVEC batterie ({battery_power_kw:.0f} kW / "
             f"{battery_capacity_kwh:.0f} kWh, dispatch simplifié autoconsommation max) -- "
-            f"PV produit : **{_live_pvm['pv_total']:,.0f} kWh/an** · "
-            f"Conso client : **{_live_pvm['conso_total']:,.0f} kWh/an** · "
-            f"Injection réseau estimée : **{_live_pvm['export']:,.0f} kWh/an** · "
+            f"PV produit : **{fmt_number(_live_pvm['pv_total'], suffix='kWh/an')}** · "
+            f"Conso client : **{fmt_number(_live_pvm['conso_total'], suffix='kWh/an')}** · "
+            f"Injection réseau estimée : **{fmt_number(_live_pvm['export'], suffix='kWh/an')}** · "
             f"Autoconsommation : **{_live_pvm['autoconso_pct']:.1f} %** · "
-            f"Autonomie énergétique : **{_live_pvm['autonomie_pct']:.1f} %**".replace(",", " ")
+            f"Autonomie énergétique : **{_live_pvm['autonomie_pct']:.1f} %**"
         )
         st.caption(
             "⚠️ Dispatch simplifié (maximise juste l'autoconsommation, sans arbitrage "
@@ -335,11 +409,11 @@ if _live_pvm:
     else:
         st.caption(
             f"📊 Aperçu instantané (sans batterie -- puissance/capacité à 0, recalculé à "
-            f"chaque changement) -- PV produit : **{_live_pvm['pv_total']:,.0f} kWh/an** · "
-            f"Conso client : **{_live_pvm['conso_total']:,.0f} kWh/an** · "
-            f"Injection réseau estimée : **{_live_pvm['export']:,.0f} kWh/an** · "
+            f"chaque changement) -- PV produit : **{fmt_number(_live_pvm['pv_total'], suffix='kWh/an')}** · "
+            f"Conso client : **{fmt_number(_live_pvm['conso_total'], suffix='kWh/an')}** · "
+            f"Injection réseau estimée : **{fmt_number(_live_pvm['export'], suffix='kWh/an')}** · "
             f"Autoconsommation : **{_live_pvm['autoconso_pct']:.1f} %** · "
-            f"Autonomie énergétique : **{_live_pvm['autonomie_pct']:.1f} %**".replace(",", " ")
+            f"Autonomie énergétique : **{_live_pvm['autonomie_pct']:.1f} %**"
         )
 else:
     st.caption(
@@ -440,8 +514,8 @@ if mode == "vente_directe":
     prix_kwc_pv = prix_revient_kwc_pv * _marge_mult
     prix_kwh_batterie = prix_revient_kwh_batterie * _marge_mult
     st.caption(
-        f"→ Prix de vente PV : **{prix_kwc_pv:,.0f} €/kWc** · Prix de vente batterie : "
-        f"**{prix_kwh_batterie:,.0f} €/kWh** (multiplicateur ×{_marge_mult:.4f})".replace(",", " ")
+        f"→ Prix de vente PV : **{fmt_number(prix_kwc_pv)} €/kWc** · Prix de vente batterie : "
+        f"**{fmt_number(prix_kwh_batterie)} €/kWh** (multiplicateur ×{_marge_mult:.4f})"
     )
     maintenance_eur_an = st.number_input("Maintenance annuelle (€/an)", value=0.0, step=50.0)
 else:
@@ -515,15 +589,53 @@ if submitted:
             f.write(belpex_upload_file.getbuffer())
     elif belpex_source == "demo":
         dayahead_path = "__no_file__"  # force le mode demo dans load_dayahead_prices
+    elif belpex_source == "auto":
+        dayahead_path = None  # resolu plus bas, une fois les vraies dates client connues (df)
     else:
         dayahead_path = os.path.join(BELPEX_DATA_DIR, f"belpex_{belpex_source}_qh.pkl")
+        if belpex_date_fin is not None:
+            # Tranche demandee : 1er janvier -> belpex_date_fin de l'annee source. On ecrit
+            # une copie tronquee du .pkl (meme pattern que l'upload) -- load_dayahead_prices
+            # n'utilisera alors, pour son calage jour/mois/heure, que les prix de cette tranche.
+            _full_series = pd.read_pickle(dayahead_path)
+            _tz = _full_series.index.tz
+            _fin_ts = pd.Timestamp(belpex_date_fin, tz=_tz) + pd.Timedelta(hours=23, minutes=45)
+            _tronquee = _full_series[_full_series.index <= _fin_ts]
+            dayahead_path = os.path.join(WORKDIR, f"belpex_{belpex_source}_tronque.pkl")
+            _tronquee.to_pickle(dayahead_path)
+            st.caption(
+                f"Prix Day-Ahead : source '{belpex_source}' limitée à la tranche "
+                f"1er janvier -> {belpex_date_fin.strftime('%d/%m/%Y')} "
+                f"({len(_tronquee)} points sur {len(_full_series)})."
+            )
 
     try:
         # pv_profile_1kwc a deja ete resolu plus haut (source Excel fige OU
-        # PVGIS, selon le choix fait dans "1. Donnees du site").
-        with st.spinner("Lecture du CSV de consommation et alignement avec le profil PV..."):
+        # PVGIS, selon le choix fait dans "1. Donnees du site"). La conso
+        # peut venir d'un CSV uploade OU d'un profil-type integre mis a
+        # l'echelle (conso_series_profile), selon le choix fait plus haut.
+        with st.spinner("Lecture de la consommation et alignement avec le profil PV..."):
             df = build_timeseries_from_sources(
-                conso_file, pv_profile_1kwc, kwc=kwc, unit=conso_unit)
+                conso_series_profile if conso_series_profile is not None else conso_file,
+                pv_profile_1kwc, kwc=kwc, unit=conso_unit)
+
+        n_truncated_qh = df.attrs.get("n_truncated_qh", 0)
+        if n_truncated_qh:
+            st.warning(
+                f"⚠️ Le relevé de consommation dépasse 12 mois : {n_truncated_qh} pas de temps "
+                f"({n_truncated_qh * 15 / 60:.0f} h) au-delà de la première année ont été ignorés. "
+                f"La simulation tourne sur exactement 1 an, à partir de la première date du relevé."
+            )
+
+        if dayahead_path is None:  # belpex_source == "auto"
+            annees_client = sorted(set(df.index.year.tolist()))
+            annee_choisie = next((a for a in annees_client if str(a) in _belpex_annees_dispo),
+                                  max(_belpex_annees_dispo))
+            dayahead_path = os.path.join(BELPEX_DATA_DIR, f"belpex_{annee_choisie}_qh.pkl")
+            st.caption(
+                f"Prix Day-Ahead : année Belpex '{annee_choisie}' utilisée comme référence "
+                f"(calée jour par jour sur les dates réelles {annees_client[0]}-{annees_client[-1]})."
+            )
 
         progress_bar = st.progress(0.0, text="Simulation en cours...")
 
@@ -583,46 +695,71 @@ if results:
     pv_utilisee = min(max(pv_total - pv_exporte - pv_curtail, 0.0), pv_total)
     autoconsommation_pct = 100 * pv_utilisee / pv_total if pv_total > 0 else 0.0
     autonomie_pct = 100 * pv_utilisee / conso_total if conso_total > 0 else 0.0
-    if mode_label == "fournisseur_principal":
-        st.caption(
-            "ℹ️ Autoconsommation/autonomie ci-dessous : estimation indirecte, moins "
-            "fiable en mode arbitrage Belpex (la batterie cycle aussi de l'énergie "
-            "réseau, pas uniquement du PV)."
+    if mode_label == "fournisseur_principal" and has_battery:
+        st.info(
+            "ℹ️ Autoconsommation/autonomie ci-dessous : estimation **indirecte** (déduite de "
+            "l'import/export réseau, pas tracée flux par flux), moins fiable en mode arbitrage "
+            "Belpex -- la batterie peut se charger avec de l'électricité réseau bon marché puis "
+            "la revendre, ce qui réduit l'import sans rapport avec le PV et peut gonfler ces "
+            "chiffres au-delà de leur vraie valeur physique. Fiable surtout en mode fournisseur "
+            "secondaire / vente directe (pas d'arbitrage réseau)."
         )
 
     if results.get("pv_clip_onduleur_kwh", 0.0) > 0:
         st.info(
-            f"ℹ️ Écrêtement onduleur : **{results['pv_clip_onduleur_kwh']:,.0f} kWh/an** de "
+            f"ℹ️ Écrêtement onduleur : **{fmt_number(results['pv_clip_onduleur_kwh'], suffix='kWh/an')}** de "
             f"production PV perdue car la puissance instantanée dépassait la puissance "
             f"nominale de l'onduleur ({kva_onduleur:.1f} kVA). Augmente la puissance de "
             f"l'onduleur (ou choisis un autre modèle catalogue) pour réduire cette perte."
-            .replace(",", " ")
         )
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("CAPEX total", f"{results['capex_total']:,.0f} EUR".replace(",", " "))
+    m1.metric("CAPEX total", fmt_eur(results['capex_total']))
     m2.metric("Payback", f"{results['payback_year']:.1f} ans" if results["payback_year"] else "Non atteint")
-    m3.metric("VAN", f"{results['npv_eur']:,.0f} EUR".replace(",", " "))
-    m4.metric("TRI", f"{results['irr_pct']:.1f} %" if results["irr_pct"] == results["irr_pct"] else "N/A")
+    m3.metric("VAN", fmt_eur(results['npv_eur']),
+              help="Valeur Actuelle Nette : cash-flows **actualisés** (taux d'actualisation "
+                   "appliqué) sur tout l'horizon -- prend en compte que 1 EUR futur vaut moins "
+                   "que 1 EUR aujourd'hui.")
+    if results["irr_pct"] == results["irr_pct"]:  # pas NaN
+        _tri_txt = f"{results['irr_pct']:.1f} %"
+    else:
+        from engine.finance_utils import irr_failure_reason
+        _tri_cashflows = [-results["capex_total"]] + df["cashflow_annuel_eur"].tolist()
+        _tri_reason = irr_failure_reason(_tri_cashflows)
+        _tri_txt = {
+            "toujours_rentable": "Non calculable (rentabilité très élevée)",
+            "jamais_rentable": "Non calculable (jamais rentable)",
+        }.get(_tri_reason, "N/A")
+    m4.metric("TRI", _tri_txt,
+              help="Taux de Rentabilité Interne : le taux d'actualisation pour lequel la VAN "
+                   "serait nulle -- **actualisé**, comparable à un taux de placement financier. "
+                   "Non calculable si aucune solution n'a été trouvée dans la plage testée "
+                   "(taux de -99% à +1000%) : soit les cash-flows sont toujours positifs "
+                   "(rentabilité hors plage, très favorable), soit toujours négatifs "
+                   "(le projet ne se rembourse jamais sur cet horizon).")
 
     m5, m6, m7, m8, m9 = st.columns(5)
-    m5.metric("Economie client an 1", f"{df.loc[0,'economie_client_eur']:,.0f} EUR".replace(",", " "))
-    m6.metric(f"Economie client cumulee ({len(df)} ans)", f"{results['total_economie_client']:,.0f} EUR".replace(",", " "))
+    m5.metric("Economie client an 1", fmt_eur(df.loc[0,'economie_client_eur']))
+    m6.metric(f"Economie client cumulee ({len(df)} ans)", fmt_eur(results['total_economie_client']))
     m7.metric(
         "Gain brut cumule (toi)" if mode_label in ("fournisseur_principal", "fournisseur_secondaire") else "Gain vendeur (= CAPEX encaisse)",
-        f"{results['gain_vendeur_eur']:,.0f} EUR".replace(",", " "))
-    m8.metric("ROI net non-actualise", f"{results['roi_pct']:.1f} %")
+        fmt_eur(results['gain_vendeur_eur']))
+    m8.metric("ROI net non-actualise", f"{results['roi_pct']:.1f} %",
+              help="Retour sur investissement **NON actualisé** : simple somme brute des "
+                   "cash-flows sur l'horizon, rapportée au CAPEX -- ne tient PAS compte du fait "
+                   "qu'un gain lointain vaut moins qu'un gain immédiat. À ne pas comparer "
+                   "directement au TRI (lui, actualisé) : les deux mesurent des choses différentes.")
     m9.metric(
         "Gain brut fournisseur an 1" if mode_label in ("fournisseur_principal", "fournisseur_secondaire") else "Gain vendeur an 1 (CAPEX encaisse a la vente)",
-        f"{df.loc[0,'gain_brut_fournisseur_eur']:,.0f} EUR".replace(",", " "))
+        fmt_eur(df.loc[0,'gain_brut_fournisseur_eur']))
 
     m10, m11, m12, m13, m14 = st.columns(5)
-    m10.metric("Consommation totale client (an 1)", f"{conso_total:,.0f} kWh/an".replace(",", " "))
+    m10.metric("Consommation totale client (an 1)", fmt_number(conso_total, suffix="kWh/an"))
     m13.metric("Consommation totale apres asset (an 1)",
-               f"{er['import_kwh']:,.0f} kWh/an".replace(",", " "))
+               fmt_number(er['import_kwh'], suffix="kWh/an"))
     m11.metric("Autoconsommation PV", f"{autoconsommation_pct:.1f} %")
     m12.metric("Autonomie énergétique", f"{autonomie_pct:.1f} %")
-    m14.metric("Injection réseau (an 1)", f"{er['export_kwh']:,.0f} kWh/an".replace(",", " "))
+    m14.metric("Injection réseau (an 1)", fmt_number(er['export_kwh'], suffix="kWh/an"))
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Cashflow & Economie client", "Origine du gain", "Detail annuel",
@@ -707,7 +844,7 @@ if results:
             fig_annuel.add_trace(go.Bar(
                 y=["APRES PV", "AVANT PV"], x=[total_apres, total_avant], orientation="h",
                 marker_color=[TEAL, NAVY],
-                text=[f"{total_apres:,.0f} EUR".replace(",", " "), f"{total_avant:,.0f} EUR".replace(",", " ")],
+                text=[fmt_eur(total_apres), fmt_eur(total_avant)],
                 textposition="inside", insidetextanchor="end", textfont=dict(color="white", size=13),
             ))
             fig_annuel.update_layout(
@@ -746,17 +883,25 @@ if results:
             st.plotly_chart(fig3, use_container_width=True)
         with c2:
             st.markdown("**Decomposition en cascade (sans double comptage)**")
-            st.write(f"- Cout sans assets : **{decomp['cout_sans_rien_eur']:,.0f} EUR**".replace(",", " "))
-            st.write(f"- Cout avec PV : **{decomp['cout_pv_seul_eur']:,.0f} EUR**".replace(",", " "))
-            st.write(f"- Cout avec PV + batterie : **{decomp['cout_pv_batterie_eur']:,.0f} EUR**".replace(",", " "))
-            st.write(f"- Gain PV : **{decomp['gain_pv_eur']:,.0f} EUR**".replace(",", " "))
-            st.write(f"- Gain Batterie : **{decomp['gain_batterie_belpex_eur']:,.0f} EUR**".replace(",", " "))
+            st.write(f"- Cout sans assets : **{fmt_eur(decomp['cout_sans_rien_eur'])}**")
+            st.write(f"- Cout avec PV : **{fmt_eur(decomp['cout_pv_seul_eur'])}**")
+            st.write(f"- Cout avec PV + batterie : **{fmt_eur(decomp['cout_pv_batterie_eur'])}**")
+            st.write(f"- Gain PV : **{fmt_eur(decomp['gain_pv_eur'])}**")
+            st.write(f"- Gain Batterie : **{fmt_eur(decomp['gain_batterie_belpex_eur'])}**")
+            if decomp["gain_pv_eur"] < 0 or decomp["gain_batterie_belpex_eur"] < 0:
+                st.warning(
+                    "⚠️ Un gain décomposé est négatif : cas limite du dispatch (le tarif "
+                    "capacitaire ou une contrainte de contrat peut rendre l'ajout de PV/batterie "
+                    "ponctuellement défavorable dans cette décomposition). Le camembert ci-contre "
+                    "plafonne à 0 pour rester lisible -- vérifie le gain total et les hypothèses "
+                    "(contrat souscrit, tarif capacitaire) si ce chiffre te surprend."
+                )
 
         st.markdown("**Bilan energetique annee 1**")
-        st.write(f"PV produit : {pv_total:,.0f} kWh/an".replace(",", " "))
-        st.write(f"Consommation totale client : {conso_total:,.0f} kWh/an".replace(",", " "))
-        st.write(f"Importé du reseau : {er['import_kwh']:,.0f} kWh/an".replace(",", " "))
-        st.write(f"Exporté au reseau : {er['export_kwh']:,.0f} kWh/an".replace(",", " "))
+        st.write(f"PV produit : {fmt_number(pv_total, suffix='kWh/an')}")
+        st.write(f"Consommation totale client : {fmt_number(conso_total, suffix='kWh/an')}")
+        st.write(f"Importé du reseau : {fmt_number(er['import_kwh'], suffix='kWh/an')}")
+        st.write(f"Exporté au reseau : {fmt_number(er['export_kwh'], suffix='kWh/an')}")
         st.write(f"Autoconsommation PV (prod. PV utilisée / prod. PV totale) : {autoconsommation_pct:.1f} %")
         st.write(f"Autonomie énergétique (prod. PV utilisée / conso. totale client) : {autonomie_pct:.1f} %")
         st.write(f"Cycles équivalents batterie : {er['cycles_equivalents']:.1f}")
@@ -1017,7 +1162,12 @@ if results:
                 st.markdown("**Loyer + Maintenance**")
                 fp_surface = st.number_input("Surface utile (m2)", value=0.0, step=10.0, key="fp_surface")
                 fp_loyer_m2 = st.number_input("Loyer surface (EUR/m2)", value=0.0, step=0.5, key="fp_loyer_m2")
-                fp_indexation_loyer = st.number_input("Indexation loyer (%)", value=0.0, step=0.1, key="fp_indexation_loyer") / 100
+                fp_indexation_loyer = st.number_input(
+                    "Indexation loyer (%)", value=0.0, step=0.1, key="fp_indexation_loyer",
+                    help="⚠️ Champ affiché pour fidélité avec le classeur Excel source, mais "
+                         "SANS EFFET sur le calcul : le loyer est en réalité indexé sur "
+                         "'Indexation Maintenance/Nettoyage' ci-dessous (reproduction fidèle "
+                         "d'une particularité de l'Excel d'origine).") / 100
                 fp_assurance_pct = st.number_input("Frais assurance (% du CAPEX)", value=0.0, step=0.1, key="fp_assurance") / 100
                 fp_maintenance_kwc = st.number_input("Frais Maintenance/Monitoring (EUR/kWc)", value=7.0, step=0.5, key="fp_maintenance_kwc")
                 fp_nettoyage_kwc = st.number_input("Nettoyage (EUR/kWc)", value=0.0, step=0.5, key="fp_nettoyage_kwc")
