@@ -374,15 +374,15 @@ with col1.container(border=True):
                 _guess = guess_csv_columns(_csv_cols)
                 _fid = abs(hash(tuple(_csv_cols)))  # cle par jeu de colonnes : la liste change d'un fichier a l'autre
                 _NO_INJ = "— aucune —"
-                cc_a, cc_b, cc_c = st.columns(3)
+                cc_a, cc_b = st.columns(2)
                 conso_ts_col = cc_a.selectbox(
-                    "Colonne horodatage", _csv_cols, index=_csv_cols.index(_guess["timestamp"]),
+                    "Horodatage", _csv_cols, index=_csv_cols.index(_guess["timestamp"]),
                     key=f"csv_ts_{_fid}")
                 conso_val_col = cc_b.selectbox(
-                    "Colonne consommation", _csv_cols, index=_csv_cols.index(_guess["conso"]),
+                    "Consommation", _csv_cols, index=_csv_cols.index(_guess["conso"]),
                     key=f"csv_conso_{_fid}")
-                _inj_choice = cc_c.selectbox(
-                    "Colonne injection (optionnel)", [_NO_INJ] + _csv_cols,
+                _inj_choice = st.selectbox(
+                    "Injection (optionnel)", [_NO_INJ] + _csv_cols,
                     index=(_csv_cols.index(_guess["injection"]) + 1) if _guess["injection"] else 0,
                     key=f"csv_inj_{_fid}",
                     help="Injection mesurée au compteur (même unité que la consommation). "
