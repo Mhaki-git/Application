@@ -60,27 +60,37 @@ Windows).
 
 ## Utilisation
 
-1. Renseigner la consommation du client : soit un releve CSV (horodatage +
-   valeur, pas de temps quelconque detecte automatiquement), soit un
-   profil-type integre mis a l'echelle sur une consommation annuelle
-   cible.
+1. Renseigner la consommation du client : soit un releve CSV ou Excel
+   (.xlsx), soit un profil-type integre mis a l'echelle sur une
+   consommation annuelle cible. Pour un releve, choisir les colonnes
+   horodatage et consommation (detectees automatiquement) et, en option,
+   une colonne d'injection : l'injection mesuree s'affiche dans l'apercu
+   instantane a titre indicatif (elle ne pilote pas le calcul). Pas de
+   temps quelconque (15/30/60 min), detecte automatiquement.
 2. Renseigner la production PV : profil fige integre (extrait au
    prealable depuis l'Excel modele) ou recuperation en direct via
    l'API PVGIS.
 3. En mode "Fournisseur principal", renseigner les prix Day-Ahead
-   Belpex : annee integree, fichier CSV personnel (horodatage + prix en
-   EUR/kWh), ou mode demonstration (prix simules -- a ne pas utiliser
-   pour un client reel).
+   Belpex : annee integree, fichier personnel CSV ou Excel (horodatage +
+   prix, unite EUR/kWh ou EUR/MWh, detectee automatiquement), ou mode
+   demonstration (prix simules -- a ne pas utiliser pour un client reel).
+   Les prix de l'annee source sont reconduits a l'identique sur tout
+   l'horizon.
 4. Ajuster les parametres (PV, batterie, prix, marges, hypotheses
-   financieres).
+   financieres). En mode "Fournisseur principal", le contrat client peut
+   etre a prix fixe ou a taux variable (contrat marche : prix Belpex de
+   chaque quart d'heure + marge fournisseur + taxes). En "Vente directe",
+   les marges PV et batterie sont distinctes.
 5. Lancer la simulation. Le calcul complet (jusqu'a 20 ans, dispatch
    optimise jour par jour) peut prendre plusieurs minutes selon l'horizon
    choisi ; une barre de progression indique l'avancement.
 6. Consulter les resultats (indicateurs, graphiques, detail annuel).
 7. En mode "Fournisseur secondaire" uniquement : completer et generer la
    "Fiche financiere" (financement par emprunt, loyer, maintenance,
-   certificats verts -- reproduit l'onglet Excel correspondant, champs
-   pre-remplis depuis la simulation).
+   certificats verts -- reproduit l'onglet Excel correspondant, marges PV
+   et batterie distinctes). A chaque nouvelle simulation, les champs issus
+   de la simulation (kWc, batterie, production, prix de vente) se mettent
+   a jour s'ils ont change ; les autres reglages sont conserves.
 8. Generer et telecharger le rapport PDF et le CSV detaille.
 
 Le fichier Excel modele (.xlsm, feuilles "DONNEES ENERGIE" et "PVS")
