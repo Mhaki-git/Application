@@ -38,6 +38,7 @@ PV_DEGRADATION_YEAR3PLUS_FACTOR = 0.996  # production annee N+1 = annee N * ce f
 
 DEFAULT_PARAMS = {
     "marge": 1.3,                          # B3
+    "marge_batterie": 1.0,                 # marge propre a la batterie (1.0 = cout materiel sans marge, comme l'Excel d'origine)
     "puissance_batterie_kva": 0.0,         # G4
     "subsides_pct": 0.2,                   # B6
     "kwc": 75.0,                           # G6
@@ -78,7 +79,7 @@ def compute_fiche(params: dict) -> dict:
 
     # --- Bloc "Details projets" / CAPEX (B3:B9) ---------------------------
     pv_cost = PV_COST_EUR_PER_KWC * kwc * marge + PV_COST_FIXED_EUR   # B4
-    bess_cost = BESS_COST_EUR_PER_KVA * puissance_batterie_kva        # B5
+    bess_cost = BESS_COST_EUR_PER_KVA * puissance_batterie_kva * p["marge_batterie"]  # B5 (x marge batterie, 1.0 par defaut)
     capex = (1 - subsides_pct) * marge + pv_cost + bess_cost  # B7 (formule reproduite telle quelle)
 
     # --- Bloc "Donnees de production" (D3:H9) ------------------------------
@@ -325,7 +326,8 @@ def build_fiche_pdf(fiche: dict, output_path: str, client_name: str = "", site_n
     story.append(Paragraph("Details projet & CAPEX", h2))
     story.append(param_table([
         ["Marge", f"{p['marge']:.2f}", "PV", _fmt_eur(fiche['capex_pv'])],
-        ["BESS", _fmt_eur(fiche['capex_bess']), "Subsides", _fmt_pct(100 * p["subsides_pct"])],
+        ["Marge batterie", f"{p['marge_batterie']:.2f}", "BESS", _fmt_eur(fiche['capex_bess'])],
+        ["Subsides", _fmt_pct(100 * p["subsides_pct"]), "", ""],
         ["CAPEX total", _fmt_eur(fiche['capex_total']), "OPEX (25 ans)", _fmt_eur(fiche['opex_total'])],
         ["Annees d'exploitation FW", f"{p['annees_exploitation_fw']:.0f} ans", "", ""],
     ], [5.5 * cm, 4 * cm, 5.5 * cm, 4 * cm]))

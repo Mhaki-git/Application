@@ -314,6 +314,25 @@ def build_tariff_fournisseur(market_price_values: np.ndarray, params: dict, infl
     return price_import, price_export
 
 
+def is_contrat_variable(params: dict) -> bool:
+    """Vrai si le client est sur un contrat a taux VARIABLE (contrat marche) :
+    il paie chaque quart d'heure le prix Day-Ahead + une marge fournisseur +
+    les taxes/couts proportionnels, au lieu d'un prix fixe. Ne concerne que le
+    mode "fournisseur_principal" (seul mode avec un prix de marche)."""
+    return (params.get("mode_vente", "fournisseur_principal") == "fournisseur_principal"
+            and params.get("contrat_client", "fixe") == "variable")
+
+
+def client_variable_price(market_price_values: np.ndarray, params: dict,
+                          inflation_factor: float = 1.0) -> np.ndarray:
+    """Prix facture au client (EUR/kWh, quart-horaire) sous contrat variable :
+    prix de marche + (marge du contrat + taxes/couts proportionnels) x indexation
+    inflation, comme les autres marges du modele. Le prix de marche lui-meme
+    n'est pas indexe ici (voir APPLIQUER_INFLATION_AU_PRIX_MARCHE pour le cote achat)."""
+    fixe = (params.get("marge_contrat_variable", 0.0) + params["taxes_couts_proportionnels"]) * inflation_factor
+    return market_price_values + fixe
+
+
 def build_tariff_reference(params: dict, hour_all: np.ndarray):
     """
     Construit price_import/price_export SANS marche Day-Ahead (pas de Belpex),
@@ -1221,9 +1240,16 @@ def _dispatch_one_year(year: int, ctx: YearDispatchContext):
         # l'horizon -> on reutilise directement revenue_client_year1 au lieu
         # de refaire le meme calcul (prix_vente_annee renverrait de toute
         # facon prix_base inchange, mais ceci evite le recalcul de la somme).
-        revenue_client_year = prix_vente_annee(
-            params["prix_vente_kwh"], year, revision_prix_pct, periode_revision_annees
-        ) * float(conso_all.sum()) if revision_prix_pct else revenue_client_year1
+        if is_contrat_variable(params):
+            # Contrat marche : le client paie chaque quart d'heure le prix de
+            # marche + marge + taxes (mp_year est celui du dispatch ci-dessus).
+            revenue_client_year = float((conso_all * (
+                mp_year + (params.get("marge_contrat_variable", 0.0)
+                           + params["taxes_couts_proportionnels"]) * inflation_factor)).sum())
+        else:
+            revenue_client_year = prix_vente_annee(
+                params["prix_vente_kwh"], year, revision_prix_pct, periode_revision_annees
+            ) * float(conso_all.sum()) if revision_prix_pct else revenue_client_year1
         old_cost_year = old_cost_year1 * inflation_factor
         dont_energie_eur = energy_cost
 
@@ -1444,7 +1470,14 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
         revenue_client_year1 = pv_totale_y1 * params["prix_vente_kwh"]
     else:
         old_cost_year1 = client_old_cost(conso_all, hour_all, params, index=index)
-        revenue_client_year1 = params["prix_vente_kwh"] * conso_totale
+        if is_contrat_variable(params):
+            revenue_client_year1 = float((conso_all * client_variable_price(market_price_values, params)).sum())
+            # Prix moyen pondere par la conso : sert d'affichage (rapport PDF, resume)
+            # a la place du prix fixe. Copie du dict pour ne pas muter celui de l'appelant.
+            params = dict(params)
+            params["prix_vente_kwh"] = revenue_client_year1 / conso_totale if conso_totale > 0 else 0.0
+        else:
+            revenue_client_year1 = params["prix_vente_kwh"] * conso_totale
 
     print(f"\n=== ANNEE 1 (reference) ===")
     print(f"Consommation totale du client : {conso_totale:,.0f} kWh/an")
@@ -1454,7 +1487,8 @@ def _run_fournisseur_model_impl(xlsm_path, dayahead_pkl_path, horizon_annees, di
         print(f"Cout de cette energie au nouveau prix fixe ({params['prix_vente_kwh']:.3f} EUR/kWh) : {revenue_client_year1:,.0f} EUR/an")
     else:
         print(f"Ancien cout client (avant toi) : {old_cost_year1:,.0f} EUR/an")
-        print(f"Nouveau cout client (prix fixe {params['prix_vente_kwh']:.3f} EUR/kWh) : {revenue_client_year1:,.0f} EUR/an")
+        _lbl = "contrat variable, prix moyen" if is_contrat_variable(params) else "prix fixe"
+        print(f"Nouveau cout client ({_lbl} {params['prix_vente_kwh']:.3f} EUR/kWh) : {revenue_client_year1:,.0f} EUR/an")
 
     print("\nCalcul du dispatch annee 1 (PV + batterie, systeme reel)...")
     (energy_cost_y1, demand_charge_y1, import_y1, export_y1, curtail_y1,

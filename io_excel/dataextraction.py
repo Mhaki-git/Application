@@ -337,6 +337,90 @@ def _parse_timestamp_column(col: pd.Series) -> pd.DatetimeIndex:
         return pd.to_datetime(col, dayfirst=True, format="mixed")
 
 
+_TIMESTAMP_NAMES = ["timestamp", "datetime", "date", "date/heure", "date_heure", "horodatage"]
+_CONSO_NAMES = ["conso", "consommation", "value", "valeur", "kw", "kwh", "power", "puissance",
+                "prelevement", "prélèvement", "offtake", "volume_prelevement"]
+_INJECTION_NAMES = ["injection", "injections", "inj", "export", "exportation", "injecte", "injecté",
+                    "production", "volume_injection"]
+
+
+def list_csv_columns(csv_path_or_buffer) -> list:
+    """Noms des colonnes d'un CSV (separateur ',' ou ';' detecte automatiquement),
+    pour laisser l'utilisateur choisir horodatage / consommation / injection."""
+    df = _read_csv_robuste(csv_path_or_buffer)
+    return [str(c) for c in df.columns]
+
+
+def guess_csv_columns(columns) -> dict:
+    """Devine {timestamp, conso, injection} parmi les noms de colonnes (insensible
+    a la casse, correspondance exacte puis par mot contenu). `injection` vaut None
+    si aucune colonne ne ressemble a de l'injection."""
+    cols = list(columns)
+    low = {c: c.strip().lower() for c in cols}
+
+    def pick(names, exclude=()):
+        for c in cols:
+            if c not in exclude and low[c] in names:
+                return c
+        for c in cols:
+            if c not in exclude and any(n in low[c] for n in names if len(n) >= 3):
+                return c
+        return None
+
+    ts = pick(_TIMESTAMP_NAMES) or cols[0]
+    inj = pick(_INJECTION_NAMES, exclude=(ts,))
+    conso = pick(_CONSO_NAMES, exclude=(ts, inj)) or next((c for c in cols if c not in (ts, inj)), cols[0])
+    return {"timestamp": ts, "conso": conso, "injection": inj}
+
+
+def read_conso_injection_csv(csv_path_or_buffer, timestamp_col: str = None, value_col: str = None,
+                             injection_col: str = None, unit: str = "kW") -> tuple:
+    """
+    Comme read_conso_csv, mais lit en plus (optionnellement) une colonne
+    d'INJECTION mesuree. Retourne (conso_kwh, injection_kwh) : deux pd.Series
+    sur le meme index et au meme pas de temps natif, en kWh par pas ;
+    injection_kwh vaut None si injection_col n'est pas fourni.
+    Valeurs illisibles -> 0 ; les injections negatives sont ramenees a 0.
+    """
+    df = _read_csv_robuste(csv_path_or_buffer)
+    guessed = guess_csv_columns(df.columns)
+    timestamp_col = timestamp_col or guessed["timestamp"]
+    value_col = value_col or guessed["conso"]
+
+    ts = _parse_timestamp_column(df[timestamp_col])
+    frame = pd.DataFrame({"conso_raw": df[value_col].apply(_parse_decimal_str).values}, index=pd.DatetimeIndex(ts))
+    if injection_col:
+        frame["injection_raw"] = df[injection_col].apply(_parse_decimal_str).values
+    n_bad = int(frame.isna().sum().sum())
+    if n_bad:
+        print(f"  /!\\ {n_bad} valeurs illisibles dans le CSV -- remplacees par 0.")
+    frame = frame.fillna(0.0)
+    frame = frame[~frame.index.duplicated(keep="first")].sort_index()
+
+    if len(frame) < 2:
+        raise ValueError("CSV de consommation : pas assez de lignes pour deduire le pas de temps.")
+    step_minutes = int(round((frame.index[1] - frame.index[0]).total_seconds() / 60))
+    if step_minutes <= 0:
+        raise ValueError("Impossible de deduire un pas de temps positif depuis le CSV de consommation.")
+
+    if unit.lower() == "kw":
+        factor = step_minutes / 60.0
+    elif unit.lower() == "kwh":
+        factor = 1.0
+    else:
+        raise ValueError(f"unit doit etre 'kW' ou 'kWh', recu : {unit!r}")
+
+    conso = pd.Series(frame["conso_raw"].values * factor, index=frame.index, name="conso_kwh")
+    injection = None
+    if injection_col:
+        injection = pd.Series(np.clip(frame["injection_raw"].values, 0.0, None) * factor,
+                              index=frame.index, name="injection_mesuree_kwh")
+    print(f"  -> CSV conso : {len(frame)} points, pas de temps = {step_minutes} min, "
+          f"conso = {conso.sum():,.0f} kWh"
+          + (f", injection = {injection.sum():,.0f} kWh" if injection is not None else ""))
+    return conso, injection
+
+
 def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
                     value_col: str = None, unit: str = "kW") -> pd.Series:
     """
@@ -600,7 +684,8 @@ def conso_from_normalized_profile(profile: pd.Series, conso_annuelle_kwh: float)
 
 
 def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: pd.Series,
-                                    kwc: float, unit: str = "kW") -> pd.DataFrame:
+                                    kwc: float, unit: str = "kW", timestamp_col: str = None,
+                                    value_col: str = None, injection_col: str = None) -> pd.DataFrame:
     """
     Construit le DataFrame (conso_kwh, pv_kwh, hour, is_weekend) attendu par
     le moteur de dispatch (fournisseur_roi.py), a partir :
@@ -612,10 +697,17 @@ def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: p
     C'est le remplacement direct de extract_all() pour la nouvelle interface
     sans Excel : le reste du pipeline (run_fournisseur_model, etc.) n'a besoin
     d'aucune modification, il consomme ce DataFrame de la meme facon.
+
+    Pour un CSV, timestamp_col / value_col / injection_col designent les colonnes
+    a utiliser (auto-detectees si omises ; pas d'injection si injection_col est
+    None). Si une injection est lue, elle est ajoutee au DataFrame (colonne
+    "injection_mesuree_kwh", kWh par quart d'heure) a titre INFORMATIF : elle ne
+    pilote pas la simulation.
     """
     from io_sources.pv_pvgis import expand_to_quarter_hour  # import local pour eviter une dependance circulaire au chargement du module
 
     n_truncated = 0
+    injection_qh = None
     if isinstance(conso_series_or_csv, pd.Series):
         # Profil integre deja mis a l'echelle (conso_from_normalized_profile) :
         # pas de completion calendaire necessaire, on suppose l'annee deja complete.
@@ -626,9 +718,17 @@ def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: p
         # different de 15 min, d'ou l'alignement puis la completion par symetrie
         # calendaire pour obtenir une annee civile complete exploitable par le LP.
         print("Lecture de la consommation client (CSV)...")
-        conso_raw = read_conso_csv(conso_series_or_csv, unit=unit)
+        conso_raw, injection_raw = read_conso_injection_csv(
+            conso_series_or_csv, timestamp_col=timestamp_col, value_col=value_col,
+            injection_col=injection_col, unit=unit)
         conso_qh = align_conso_to_quarter_hour(conso_raw)
         conso_qh, n_truncated = fill_missing_periods_by_calendar_symmetry(conso_qh)
+        if injection_raw is not None:
+            # Meme traitement que la conso (grille 15 min puis annee civile complete),
+            # pour que les deux series restent alignees pas a pas.
+            injection_qh = align_conso_to_quarter_hour(injection_raw)
+            injection_qh, _ = fill_missing_periods_by_calendar_symmetry(injection_qh)
+            injection_qh = injection_qh.rename("injection_mesuree_kwh")
 
     print("Alignement du profil PV (PVGIS) sur la grille quart-horaire du client...")
     pv_qh = expand_to_quarter_hour(pv_hourly_profile_1kwc, kwc=kwc, target_index=conso_qh.index)
@@ -636,6 +736,8 @@ def build_timeseries_from_sources(conso_series_or_csv, pv_hourly_profile_1kwc: p
     df = pd.concat([conso_qh, pv_qh], axis=1).sort_index()
     df["conso_kwh"] = df["conso_kwh"].fillna(0.0)
     df["pv_kwh"] = df["pv_kwh"].fillna(0.0)
+    if injection_qh is not None:
+        df["injection_mesuree_kwh"] = injection_qh.reindex(df.index).fillna(0.0)
     df.index.name = "datetime"
     df["hour"] = df.index.hour
     df["is_weekend"] = df.index.dayofweek >= 5  # 5=samedi, 6=dimanche (convention pandas dayofweek)

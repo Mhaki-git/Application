@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import datetime
@@ -7,7 +8,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from io_excel.dataextraction import build_timeseries_from_sources
+from io_excel.dataextraction import build_timeseries_from_sources, list_csv_columns, guess_csv_columns
 from engine.fournisseur_roi import run_fournisseur_model_from_data
 from reporting.pdf_report import build_pdf_report
 from reporting.pdf_style import fmt_eur, fmt_number
@@ -353,14 +354,42 @@ with col1.container(border=True):
     conso_file = None
     conso_unit = "kW"
     conso_series_profile = None
+    conso_ts_col = conso_val_col = conso_inj_col = None
+
+    @st.cache_data(show_spinner=False)
+    def _csv_columns(csv_bytes: bytes):
+        # Cache : evite de reparser tout le CSV a chaque rerun juste pour lister ses colonnes.
+        return list_csv_columns(io.BytesIO(csv_bytes))
 
     if conso_source == "upload":
         conso_file = st.file_uploader(
             "Relevé de consommation (CSV)",
             type=["csv"],
-            help="2 colonnes : horodatage + valeur. Pas de temps quelconque "
-                 "(15/30/60 min), détecté automatiquement.")
-        conso_unit = st.radio("Unité de la colonne valeur", options=["kW", "kWh"], horizontal=True)
+            help="Horodatage + consommation, et en option une colonne d'injection. Pas de "
+                 "temps quelconque (15/30/60 min), détecté automatiquement.")
+        conso_unit = st.radio("Unité des colonnes de valeurs", options=["kW", "kWh"], horizontal=True)
+        if conso_file is not None:
+            try:
+                _csv_cols = _csv_columns(conso_file.getvalue())
+                _guess = guess_csv_columns(_csv_cols)
+                _fid = abs(hash(tuple(_csv_cols)))  # cle par jeu de colonnes : la liste change d'un fichier a l'autre
+                _NO_INJ = "— aucune —"
+                cc_a, cc_b, cc_c = st.columns(3)
+                conso_ts_col = cc_a.selectbox(
+                    "Colonne horodatage", _csv_cols, index=_csv_cols.index(_guess["timestamp"]),
+                    key=f"csv_ts_{_fid}")
+                conso_val_col = cc_b.selectbox(
+                    "Colonne consommation", _csv_cols, index=_csv_cols.index(_guess["conso"]),
+                    key=f"csv_conso_{_fid}")
+                _inj_choice = cc_c.selectbox(
+                    "Colonne injection (optionnel)", [_NO_INJ] + _csv_cols,
+                    index=(_csv_cols.index(_guess["injection"]) + 1) if _guess["injection"] else 0,
+                    key=f"csv_inj_{_fid}",
+                    help="Injection mesurée au compteur (même unité que la consommation). "
+                         "Affichée dans l'aperçu à titre indicatif ; elle ne pilote pas la simulation.")
+                conso_inj_col = None if _inj_choice == _NO_INJ else _inj_choice
+            except Exception as _e:
+                st.error(f"Lecture du CSV impossible : {_e}")
     else:
         if os.path.exists(CONSO_PROFILES_PATH):
             conso_profiles = _load_conso_profiles(CONSO_PROFILES_PATH)
@@ -576,13 +605,14 @@ has_battery = (battery_power_kw > 0) and (battery_capacity_kwh > 0)
 
 
 @st.cache_data(show_spinner=False)
-def _build_preview_timeseries_csv(conso_bytes: bytes, pv_profile: pd.Series, kwc_val: float, unit_val: str):
+def _build_preview_timeseries_csv(conso_bytes: bytes, pv_profile: pd.Series, kwc_val: float, unit_val: str,
+                                   ts_col: str = None, val_col: str = None, inj_col: str = None):
     # Prend les bytes bruts du fichier (et non l'UploadedFile lui-meme, qui
     # n'est pas hashable de maniere stable) pour que le cache Streamlit puisse
     # cler dessus correctement. Reconstruit un buffer memoire a chaque appel.
-    import io
     buf = io.BytesIO(conso_bytes)
-    return build_timeseries_from_sources(buf, pv_profile, kwc=kwc_val, unit=unit_val)
+    return build_timeseries_from_sources(buf, pv_profile, kwc=kwc_val, unit=unit_val,
+                                         timestamp_col=ts_col, value_col=val_col, injection_col=inj_col)
 
 
 @st.cache_data(show_spinner=False)
@@ -611,7 +641,9 @@ try:
     if conso_series_profile is not None:
         _df_preview = _build_preview_timeseries_profile(conso_series_profile, pv_profile_1kwc, kwc)
     else:
-        _df_preview = _build_preview_timeseries_csv(conso_file.getvalue(), pv_profile_1kwc, kwc, conso_unit)
+        _df_preview = _build_preview_timeseries_csv(
+            conso_file.getvalue(), pv_profile_1kwc, kwc, conso_unit,
+            conso_ts_col, conso_val_col, conso_inj_col)
     _pv_kwh_prev = _df_preview["pv_kwh"].values
     if kva_onduleur > 0:
         # Ecretement onduleur : la puissance instantanee est plafonnee a la
@@ -647,6 +679,9 @@ try:
     _live_pvm = {
         "pv_total": _pv_total_prev, "conso_total": _conso_total_prev,
         "export": _export_prev, "autoconso_pct": _autoconso_prev, "autonomie_pct": _autonomie_prev,
+        # Injection MESUREE du releve (colonne choisie a l'import) ; None si absente.
+        "injection_mesuree": (float(_df_preview["injection_mesuree_kwh"].sum())
+                              if "injection_mesuree_kwh" in _df_preview.columns else None),
     }
 except Exception as _e:
     _live_pvm = None
@@ -660,6 +695,12 @@ if _live_pvm:
     p3.metric("Injection (kWh/an)", fmt_number(_live_pvm["export"]))
     p4.metric("Autoconsommation", f"{_live_pvm['autoconso_pct']:.1f} %")
     p5.metric("Autonomie", f"{_live_pvm['autonomie_pct']:.1f} %")
+    if _live_pvm["injection_mesuree"] is not None:
+        q1, q2, _q3, _q4, _q5 = st.columns(5)
+        q1.metric("Injection mesurée (relevé, kWh/an)", fmt_number(_live_pvm["injection_mesuree"]),
+                  help="Somme de la colonne d'injection du CSV importé (injection réelle du client, "
+                       "avant l'installation simulée). Information seulement : elle n'entre pas "
+                       "dans le calcul.")
     if has_battery:
         st.caption(
             f"Batterie {battery_power_kw:.0f} kW / {battery_capacity_kwh:.0f} kWh en dispatch simplifié "
@@ -708,13 +749,32 @@ with st.container(border=True):
         value=0.03, step=0.005, format="%.4f",
         help="Utilisé hors mode fournisseur principal.")
 
+contrat_client = "fixe"
+marge_contrat_variable = 0.0
+
 with st.container(border=True):
     if mode == "fournisseur_principal":
         _group("Offre fournisseur · prix facturé au client")
+        contrat_client = st.radio(
+            "Contrat client", options=["fixe", "variable"],
+            format_func=lambda x: "Prix fixe" if x == "fixe" else "Taux variable (contrat marché)",
+            horizontal=True,
+            help="Prix fixe : le client paie un prix unique au kWh. Taux variable : il paie, à chaque "
+                 "quart d'heure, le prix Day-Ahead Belpex + la marge du fournisseur + les taxes et "
+                 "coûts proportionnels.")
         c1, c2, c3 = st.columns(3)
-        prix_vente_kwh = c1.number_input("Prix de vente au client (€/kWh)", value=0.12, step=0.005, format="%.4f")
+        if contrat_client == "fixe":
+            prix_vente_kwh = c1.number_input("Prix de vente au client (€/kWh)", value=0.12, step=0.005, format="%.4f")
+        else:
+            marge_contrat_variable = c1.number_input(
+                "Marge fournisseur sur le prix de marché (€/kWh)", value=0.02, step=0.005, format="%.4f",
+                help="Ajoutée au prix Day-Ahead de chaque quart d'heure pour obtenir le prix facturé au "
+                     "client (indexée sur l'inflation).")
+            prix_vente_kwh = 0.0  # remplace par le prix moyen pondere calcule par le moteur
         marge_fournisseur = c2.number_input("Marge sur achat réseau (€/kWh)", value=0.01, step=0.005, format="%.4f")
-        taxes_couts_proportionnels = c3.number_input("Taxes et coûts réseau proportionnels (€/kWh)", value=0.02, step=0.005, format="%.4f")
+        taxes_couts_proportionnels = c3.number_input(
+            "Taxes et coûts réseau proportionnels (€/kWh)", value=0.02, step=0.005, format="%.4f",
+            help=None if contrat_client == "fixe" else "Refacturés au client en plus du prix de marché et de la marge.")
         c1, c2, _c3 = st.columns(3)
         marge_injection = c1.number_input("Marge sur injection du surplus (€/kWh)", value=0.00175, step=0.005, format="%.4f")
         tarif_capacitaire_fournisseur = c2.number_input(
@@ -769,15 +829,19 @@ with st.container(border=True):
         else:
             prix_revient_kwc_pv = c1.number_input("Prix de revient PV (€/kWc)", value=650.0, step=10.0)
         prix_revient_kwh_batterie = c2.number_input("Prix de revient batterie (€/kWh)", value=225.0, step=10.0)
-        marge_vente_pct = c3.number_input("Marge (%)", value=30.0, step=1.0, min_value=0.0, max_value=95.0,
-                                           help="Marge sur prix de vente : 30% -> prix de vente = prix de revient / (1-30%) = ×1.4286")
-        maintenance_eur_an = c4.number_input("Maintenance (€/an)", value=0.0, step=50.0)
-        _marge_mult = 1.0 / (1.0 - marge_vente_pct / 100.0)
-        prix_kwc_pv = prix_revient_kwc_pv * _marge_mult
-        prix_kwh_batterie = prix_revient_kwh_batterie * _marge_mult
+        _MARGE_HELP = "Marge sur prix de vente : 30% -> prix de vente = prix de revient / (1-30%) = ×1.4286"
+        marge_pv_pct = c3.number_input("Marge PV (%)", value=30.0, step=1.0, min_value=0.0, max_value=95.0,
+                                       help=_MARGE_HELP)
+        marge_batterie_pct = c4.number_input("Marge batterie (%)", value=30.0, step=1.0, min_value=0.0,
+                                             max_value=95.0, help=_MARGE_HELP)
+        maintenance_eur_an = c1.number_input("Maintenance (€/an)", value=0.0, step=50.0)
+        _mult_pv = 1.0 / (1.0 - marge_pv_pct / 100.0)
+        _mult_batt = 1.0 / (1.0 - marge_batterie_pct / 100.0)
+        prix_kwc_pv = prix_revient_kwc_pv * _mult_pv
+        prix_kwh_batterie = prix_revient_kwh_batterie * _mult_batt
         st.caption(
-            f"Prix de vente PV : **{fmt_number(prix_kwc_pv)} €/kWc** · Prix de vente batterie : "
-            f"**{fmt_number(prix_kwh_batterie)} €/kWh** · multiplicateur ×{_marge_mult:.4f}. "
+            f"Prix de vente PV : **{fmt_number(prix_kwc_pv)} €/kWc** (×{_mult_pv:.4f}) · Prix de vente "
+            f"batterie : **{fmt_number(prix_kwh_batterie)} €/kWh** (×{_mult_batt:.4f}). "
             "Le prix de vente (= CAPEX payé par le client = gain vendeur) est calculé automatiquement."
         )
     else:
@@ -846,6 +910,8 @@ if submitted:
         "marge_injection": marge_injection,
         "tarif_capacitaire_fournisseur": tarif_capacitaire_fournisseur,
         "mode_vente": mode,
+        "contrat_client": contrat_client,
+        "marge_contrat_variable": marge_contrat_variable,
         "prix_kwc_pv": prix_kwc_pv,
         "prix_kwh_batterie": prix_kwh_batterie,
         "maintenance_eur_an": maintenance_eur_an,
@@ -892,8 +958,10 @@ if submitted:
         # l'echelle (conso_series_profile), selon le choix fait plus haut.
         with st.spinner("Lecture de la consommation et alignement avec le profil PV..."):
             df = build_timeseries_from_sources(
-                conso_series_profile if conso_series_profile is not None else conso_file,
-                pv_profile_1kwc, kwc=kwc, unit=conso_unit)
+                (conso_series_profile if conso_series_profile is not None
+                 else io.BytesIO(conso_file.getvalue())),
+                pv_profile_1kwc, kwc=kwc, unit=conso_unit,
+                timestamp_col=conso_ts_col, value_col=conso_val_col, injection_col=conso_inj_col)
 
         n_truncated_qh = df.attrs.get("n_truncated_qh", 0)
         if n_truncated_qh:
@@ -1482,23 +1550,44 @@ def _render_results(results):
         _fp_params = results["params"]
         _pv_prod_an1 = er.get("pv_total_kwh", 0.0) or 0.0
 
+        # Synchronisation avec la simulation : a chaque nouvelle simulation, seuls les champs
+        # dont la valeur SOURCE a change depuis la precedente (puissance PV, batterie,
+        # production, prix de vente) sont mis a jour ; les autres reglages de la fiche
+        # (marges, financement, loyer...) gardent la valeur saisie. Ces 4 champs n'ont donc
+        # pas de `value=` : leur valeur initiale est posee ici dans session_state.
+        _fp_src = {
+            "fp_kwc": float(_fp_params["kwc"]),
+            "fp_batt_kva": float(_fp_params.get("battery_power_kw", 0.0) or 0.0),
+            "fp_prod_pv": float(_pv_prod_an1),
+            "fp_prix_vente": float(_fp_params.get("prix_vente_kwh", 0.16) or 0.16),
+        }
+        _fp_prev = st.session_state.get("fp_src", {})
+        for _k, _v in _fp_src.items():
+            if _k not in st.session_state or abs(_fp_prev.get(_k, _v) - _v) > 1e-9:
+                st.session_state[_k] = _v
+        st.session_state["fp_src"] = _fp_src
+
         with st.container(border=True):
             fc1, fc2, fc3 = st.columns(3, gap="large")
             with fc1:
                 _group("Projet & CAPEX")
-                fp_marge = st.number_input("Marge", value=1.3, step=0.1, key="fp_marge")
+                fp_marge = st.number_input("Marge PV", value=1.3, step=0.1, key="fp_marge",
+                                           help="Multiplicateur appliqué au coût matériel PV.")
+                fp_marge_batt = st.number_input("Marge batterie", value=1.0, step=0.1, key="fp_marge_batt",
+                                                help="Multiplicateur appliqué au coût matériel de la batterie "
+                                                     "(1.0 = sans marge).")
                 fp_subsides_pct = st.number_input("Subsides (%)", value=20.0, step=1.0, key="fp_subsides") / 100
                 fp_annees_exploit = st.number_input("Années d'exploitation FW", value=20, step=1, key="fp_annees_exploit")
                 _group("Production")
-                fp_kwc = st.number_input("Puissance PV (kWc)", value=float(_fp_params["kwc"]), step=1.0, key="fp_kwc")
-                fp_batt_kva = st.number_input("Puissance batterie (kVA)", value=float(_fp_params.get("battery_power_kw", 0.0) or 0.0), step=1.0, key="fp_batt_kva")
-                fp_prod_pv = st.number_input("Production PV estimée (kWh/an)", value=float(_pv_prod_an1), step=100.0, key="fp_prod_pv")
+                fp_kwc = st.number_input("Puissance PV (kWc)", step=1.0, key="fp_kwc")
+                fp_batt_kva = st.number_input("Puissance batterie (kVA)", step=1.0, key="fp_batt_kva")
+                fp_prod_pv = st.number_input("Production PV estimée (kWh/an)", step=100.0, key="fp_prod_pv")
                 fp_prod_eol = st.number_input("Production éolienne estimée (kWh/an)", value=0.0, step=100.0, key="fp_prod_eol")
                 fp_valeur_cv = st.number_input("Valeur CV (€/MWh)", value=0.0, step=1.0, key="fp_valeur_cv")
             with fc2:
                 _group("Prix")
                 fp_indexation = st.number_input("Indexation (%/an)", value=0.0, step=0.1, key="fp_indexation") / 100
-                fp_prix_vente = st.number_input("Prix de vente (€/kWh)", value=float(_fp_params.get("prix_vente_kwh", 0.16) or 0.16), step=0.001, format="%.3f", key="fp_prix_vente")
+                fp_prix_vente = st.number_input("Prix de vente (€/kWh)", step=0.001, format="%.3f", key="fp_prix_vente")
                 fp_revenu_batt = st.number_input("Revenu annuel batterie (€/MVA)", value=0.0, step=1.0, key="fp_revenu_batt")
                 _group("Financement & fiscalité")
                 fp_apport_pct = st.number_input("Apport (%)", value=0.0, step=1.0, key="fp_apport") / 100
@@ -1527,7 +1616,7 @@ def _render_results(results):
         if _gen_fiche:
             from engine.financial_sheet import compute_fiche, build_fiche_pdf
             _fiche_params = {
-                "marge": fp_marge, "puissance_batterie_kva": fp_batt_kva,
+                "marge": fp_marge, "marge_batterie": fp_marge_batt, "puissance_batterie_kva": fp_batt_kva,
                 "subsides_pct": fp_subsides_pct, "kwc": fp_kwc,
                 "production_pv_estimee_kwh": fp_prod_pv, "production_eolienne_kwh": fp_prod_eol,
                 "valeur_cv_eur_mwh": fp_valeur_cv, "indexation_pct": fp_indexation,

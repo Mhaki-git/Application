@@ -213,7 +213,9 @@ def build_pdf_report(results: dict, output_path: str, client_name: str = ""):
     pct = 100 * savings_1 / old_c if old_c else float("nan")
     client_data = [
         ["Ancien cout annuel (avant contrat)", _fmt_eur(old_c)],
-        [f"Nouveau cout annuel (prix fixe {params['prix_vente_kwh']:.3f} EUR/kWh)", _fmt_eur(new_c)],
+        [(f"Nouveau cout annuel (contrat variable, prix moyen {params['prix_vente_kwh']:.3f} EUR/kWh)"
+          if params.get("contrat_client") == "variable" and results.get("mode_vente") == "fournisseur_principal"
+          else f"Nouveau cout annuel (prix fixe {params['prix_vente_kwh']:.3f} EUR/kWh)"), _fmt_eur(new_c)],
         ["Economie annee 1", f"{_fmt_eur(savings_1)}  ({_fmt_pct(pct)})"],
         [f"Economie cumulee sur {horizon} ans", _fmt_eur(results["total_economie_client"])],
     ]
