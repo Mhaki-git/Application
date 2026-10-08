@@ -133,3 +133,51 @@ def test_fiche_battery_margin_scales_bess_cost_only():
     marked = compute_fiche(dict(DEFAULT_PARAMS, puissance_batterie_kva=100.0, marge_batterie=1.5))
     assert marked["capex_bess"] == pytest.approx(base["capex_bess"] * 1.5)
     assert marked["capex_pv"] == pytest.approx(base["capex_pv"])
+
+
+# --- Import Excel (conso / prix) ------------------------------------------------
+
+def _xlsx_bytes(rows, header=None):
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([None, None])  # ligne vide en tete, comme dans un export reel
+    if header:
+        ws.append(header)
+    for r in rows:
+        ws.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_dayahead_excel_without_header_converts_mwh_to_kwh():
+    from io_excel.dataextraction import read_dayahead_csv
+    idx = pd.date_range("2025-01-01 00:15", periods=200, freq="15min")
+    raw = _xlsx_bytes([[t.strftime("%d/%m/%Y %H:%M"), 65.0 + i % 3] for i, t in enumerate(idx)])
+    s = read_dayahead_csv(io.BytesIO(raw))  # unit="auto"
+    assert len(s) == 200
+    assert s.median() == pytest.approx(0.066, abs=0.002)
+
+
+def test_dayahead_explicit_units():
+    from io_excel.dataextraction import read_dayahead_csv
+    idx = pd.date_range("2025-01-01", periods=50, freq="15min")
+    csv = pd.DataFrame({"timestamp": idx, "prix": 0.08}).to_csv(index=False).encode()
+    assert read_dayahead_csv(io.BytesIO(csv), unit="eur_kwh").median() == pytest.approx(0.08)
+    assert read_dayahead_csv(io.BytesIO(csv), unit="eur_mwh").median() == pytest.approx(0.00008)
+
+
+def test_conso_excel_with_header_and_injection():
+    idx = pd.date_range("2024-01-01", "2024-12-31 23:45", freq="15min")
+    raw = _xlsx_bytes([[t.to_pydatetime(), 4.0, 1.0] for t in idx],
+                      header=["Date", "Prelevement kW", "Injection kW"])
+    cols = list_csv_columns(io.BytesIO(raw))
+    assert cols == ["Date", "Prelevement kW", "Injection kW"]
+    g = guess_csv_columns(cols)
+    pv = pd.read_pickle(os.path.join(DATA_DIR, "pv_profile_1kwc.pkl"))
+    df = build_timeseries_from_sources(io.BytesIO(raw), pv, kwc=5, unit="kW",
+                                       timestamp_col=g["timestamp"], value_col=g["conso"],
+                                       injection_col=g["injection"])
+    assert df["conso_kwh"].sum() == pytest.approx(4.0 * 0.25 * len(df))
+    assert df["injection_mesuree_kwh"].sum() == pytest.approx(1.0 * 0.25 * len(df))

@@ -363,8 +363,8 @@ with col1.container(border=True):
 
     if conso_source == "upload":
         conso_file = st.file_uploader(
-            "Relevé de consommation (CSV)",
-            type=["csv"],
+            "Relevé de consommation (CSV ou Excel)",
+            type=["csv", "xlsx"],
             help="Horodatage + consommation, et en option une colonne d'injection. Pas de "
                  "temps quelconque (15/30/60 min), détecté automatiquement.")
         conso_unit = st.radio("Unité des colonnes de valeurs", options=["kW", "kWh"], horizontal=True)
@@ -432,7 +432,7 @@ with col2.container(border=True):
         horizontal=True,
         key="pv_source",
         help="Profil figé : `data/pv_profile_1kwc.pkl`, extrait une fois via "
-             "`python extract_pv_from_excel.py <fichier.xlsm>` (redémarrer l'appli ensuite). "
+             "`python io_sources/extract_pv_from_excel.py <fichier.xlsm>` (redémarrer l'appli ensuite). "
              "PVGIS : API de la Commission européenne, selon la position et l'orientation saisies.",
     )
 
@@ -445,7 +445,7 @@ with col2.container(border=True):
         else:
             st.error(
                 "Aucun profil PV figé trouvé (`data/pv_profile_1kwc.pkl`). "
-                "Lancez `python extract_pv_from_excel.py <fichier.xlsm>` une fois, "
+                "Lancez `python io_sources/extract_pv_from_excel.py <fichier.xlsm>` une fois, "
                 "ou choisissez la source PVGIS."
             )
     else:
@@ -475,6 +475,7 @@ with col2.container(border=True):
 BELPEX_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 belpex_source = "demo"
 belpex_upload_file = None
+belpex_unit = "auto"
 
 if use_belpex:
     with st.container(border=True):
@@ -529,16 +530,20 @@ if use_belpex:
             _note("Prix simulés : résultats indicatifs uniquement.", warn=True, container=bc2)
 
         if belpex_source == "upload":
+            belpex_unit = bc2.selectbox(
+                "Unité des prix du fichier", ["auto", "eur_kwh", "eur_mwh"],
+                format_func=lambda u: {"auto": "Automatique", "eur_kwh": "€/kWh", "eur_mwh": "€/MWh"}[u],
+                help="Automatique : convertit en €/kWh si la valeur médiane dépasse 2 (typiquement des €/MWh).")
             belpex_upload_file = bc2.file_uploader(
-                "Prix Day-Ahead (CSV)",
-                type=["csv"],
+                "Prix Day-Ahead (CSV ou Excel)",
+                type=["csv", "xlsx"],
                 help="2 colonnes : horodatage + prix EUR/kWh. Format CSV (pas .pkl) : un fichier "
                      ".pkl exécuterait du code Python arbitraire à la lecture s'il provient d'une "
                      "source non fiable -- le CSV n'a pas ce risque.")
 
         if not _belpex_annees_dispo:
             st.caption(
-                "Aucune année Belpex intégrée pour l'instant -- lancez `python fetch_belpex.py "
+                "Aucune année Belpex intégrée pour l'instant -- lancez `python io_sources/fetch_belpex.py "
                 "<annee> <cle_api>` une fois pour en ajouter."
             )
 else:
@@ -761,7 +766,9 @@ with st.container(border=True):
             horizontal=True,
             help="Prix fixe : le client paie un prix unique au kWh. Taux variable : il paie, à chaque "
                  "quart d'heure, le prix Day-Ahead Belpex + la marge du fournisseur + les taxes et "
-                 "coûts proportionnels.")
+                 "coûts proportionnels. Le prix de marché n'est pas indexé sur l'inflation alors que "
+                 "l'ancien coût du client l'est : l'économie client diminue donc mécaniquement "
+                 "au fil des années.")
         c1, c2, c3 = st.columns(3)
         if contrat_client == "fixe":
             prix_vente_kwh = c1.number_input("Prix de vente au client (€/kWh)", value=0.12, step=0.005, format="%.4f")
@@ -928,7 +935,7 @@ if submitted:
             st.error("Choisissez une année intégrée ou importez un fichier CSV pour les prix Belpex.")
             st.stop()
         from io_excel.dataextraction import read_dayahead_csv
-        dayahead_path = read_dayahead_csv(belpex_upload_file)
+        dayahead_path = read_dayahead_csv(belpex_upload_file, unit=belpex_unit)
     elif belpex_source == "demo":
         dayahead_path = "__no_file__"  # force le mode demo dans load_dayahead_prices
     elif belpex_source == "auto":
@@ -1038,8 +1045,12 @@ def _render_results(results):
     en argument mais provient toujours de st.session_state["results"], seule
     source de verite pour la persistance entre reruns.
     """
-    mode_label = st.session_state.get("mode", "fournisseur_principal")
+    mode_label = results.get("mode_vente") or st.session_state.get("mode", "fournisseur_principal")
     _rp = results["params"]
+    # Valeurs de LA SIMULATION affichee (et non des widgets, qui peuvent avoir change depuis).
+    _kva_r = float(_rp.get("kva_onduleur") or 0.0)
+    _contrat_kw_r = float(_rp.get("contrat_kw") or 0.0)
+    _has_battery_r = (_rp.get("battery_power_kw") or 0) > 0 and (_rp.get("battery_capacity_kwh") or 0) > 0
     df = results["detail_annuel"]
 
     _section(5, "Résultats")
@@ -1077,7 +1088,7 @@ def _render_results(results):
     pv_utilisee = min(max(pv_total - pv_exporte - pv_curtail, 0.0), pv_total)
     autoconsommation_pct = 100 * pv_utilisee / pv_total if pv_total > 0 else 0.0
     autonomie_pct = 100 * pv_utilisee / conso_total if conso_total > 0 else 0.0
-    _autoconso_indirecte = (mode_label == "fournisseur_principal" and has_battery)
+    _autoconso_indirecte = (mode_label == "fournisseur_principal" and _has_battery_r)
     _AUTOCONSO_HELP = (
         "Estimation indirecte (déduite de l'import/export réseau), moins fiable en mode "
         "arbitrage Belpex : la batterie peut se charger sur le réseau puis revendre, ce qui "
@@ -1151,9 +1162,14 @@ def _render_results(results):
     if results.get("pv_clip_onduleur_kwh", 0.0) > 0:
         _note(
             f"Écrêtement onduleur : <b>{fmt_number(results['pv_clip_onduleur_kwh'], suffix='kWh/an')}</b> "
-            f"de production perdue (puissance instantanée au-delà de {kva_onduleur:.1f} kVA). "
+            f"de production perdue (puissance instantanée au-delà de {_kva_r:.1f} kVA). "
             f"Un onduleur plus puissant ou un autre modèle catalogue réduirait cette perte.",
             warn=True)
+
+    if mode_label == "fournisseur_principal":
+        _note("Les prix Belpex de l'année source sont <b>reconduits à l'identique</b> sur tout l'horizon "
+              "(pas de scénario d'évolution du marché) : le gain d'arbitrage et de batterie est une "
+              "projection à prix constants.", warn=True)
 
     st.write("")
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
@@ -1254,13 +1270,13 @@ def _render_results(results):
                         # souscrite -- c'est ce depassement, ponctuel ou recurrent, qui
                         # declenche la penalite (OVERRUN_PENALTY_MULT dans le moteur).
                         _pic_import_kw = float((serie_cout["import_kwh"] * 4.0).max())
-                        _depassement_kw = max(_pic_import_kw - contrat_kw, 0.0)
+                        _depassement_kw = max(_pic_import_kw - _contrat_kw_r, 0.0)
                         st.caption(
                             f"⚠️ Le dispatch réel inclut {fmt_eur(_ecart_overrun)} de surcoût que la "
                             "répartition mensuelle ci-dessous ne montre pas. Origine : le pic d'import "
                             f"réseau résiduel (post PV + batterie) atteint **{_pic_import_kw:.0f} kW** à "
                             f"un moment de l'année, au-delà de la puissance souscrite "
-                            f"(**{contrat_kw:.0f} kW**, dépassement de **{_depassement_kw:.0f} kW**) -- "
+                            f"(**{_contrat_kw_r:.0f} kW**, dépassement de **{_depassement_kw:.0f} kW**) -- "
                             "ce dépassement est autorisé par le modèle mais facturé au triple du tarif "
                             "réseau. Augmenter la puissance souscrite ou la puissance batterie/onduleur "
                             "réduirait ce surcoût."

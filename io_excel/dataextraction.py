@@ -263,12 +263,44 @@ def _read_csv_robuste(csv_path_or_buffer) -> pd.DataFrame:
     (',' ou ';' -- un export Excel FR utilise generalement ';' puisque ','
     est deja pris par la virgule decimale). Le format decimal des valeurs
     est gere separement dans _parse_decimal_str, colonne par colonne."""
-    raw = _read_raw_text(csv_path_or_buffer)
+    raw_bytes = _read_raw_bytes(csv_path_or_buffer)
+    if raw_bytes[:2] == b"PK":  # signature d'une archive .xlsx
+        return _read_excel_table(raw_bytes)
+    raw = raw_bytes.decode("utf-8-sig", errors="replace")
     first_line = raw.splitlines()[0] if raw.splitlines() else ""
     sep = ";" if first_line.count(";") >= first_line.count(",") else ","
 
     import io
     return pd.read_csv(io.StringIO(raw), sep=sep)
+
+
+def _read_raw_bytes(path_or_buffer) -> bytes:
+    """Contenu binaire d'un fichier fourni par chemin ou par objet fichier/buffer."""
+    if hasattr(path_or_buffer, "read"):
+        raw = path_or_buffer.read()
+        return raw if isinstance(raw, bytes) else str(raw).encode("utf-8")
+    with open(path_or_buffer, "rb") as f:
+        return f.read()
+
+
+def _read_excel_table(raw_bytes: bytes) -> pd.DataFrame:
+    """Lit la 1ere feuille d'un .xlsx comme un tableau, comme _read_csv_robuste
+    le fait pour un CSV. Les lignes/colonnes entierement vides sont ignorees.
+    Si la 1ere ligne utile commence par une date, le fichier n'a pas d'en-tete :
+    les colonnes sont nommees "timestamp", "valeur", "valeur_2"..."""
+    import io
+    df = pd.read_excel(io.BytesIO(raw_bytes), header=None, engine="openpyxl")
+    df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Fichier Excel vide.")
+    first = df.iloc[0, 0]
+    has_header = not (isinstance(first, (pd.Timestamp, __import__("datetime").datetime))
+                      or pd.notna(pd.to_datetime(str(first), dayfirst=True, errors="coerce")))
+    if has_header:
+        df.columns = [str(c).strip() for c in df.iloc[0]]
+        return df.iloc[1:].reset_index(drop=True)
+    df.columns = ["timestamp"] + ["valeur" if i == 0 else f"valeur_{i + 1}" for i in range(df.shape[1] - 1)]
+    return df
 
 
 def _read_raw_text(csv_path_or_buffer) -> str:
@@ -487,7 +519,7 @@ def read_conso_csv(csv_path_or_buffer, timestamp_col: str = None,
 
 
 def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
-                       value_col: str = None) -> pd.Series:
+                       value_col: str = None, unit: str = "auto") -> pd.Series:
     """
     Lit une serie de prix Day-Ahead (Belpex) depuis un CSV simple, en
     remplacement d'un upload .pkl -- pd.read_pickle sur un fichier fourni par
@@ -497,6 +529,9 @@ def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
     Format attendu : 2 colonnes -- un timestamp et un prix en EUR/kWh.
     Detection automatique des noms de colonnes, du separateur (',' ou ';')
     et du format decimal (point ou virgule), meme logique que read_conso_csv.
+
+    unit : "eur_kwh", "eur_mwh" (les prix sont divises par 1000), ou "auto"
+    (convertit si la mediane depasse 2.0, ce qui trahit des EUR/MWh).
 
     Retourne une pd.Series indexee par datetime (naive), prix en EUR/kWh, au
     pas de temps natif du CSV (le calage sur les dates client se fait plus
@@ -530,7 +565,10 @@ def read_dayahead_csv(csv_path_or_buffer, timestamp_col: str = None,
     # 2.0 EUR/kWh est trop elevee pour un prix electrique plausible et trahit
     # presque toujours un oubli de conversion (diviser par 1000) en amont.
     med = float(np.nanmedian(np.abs(series.values)))
-    if med > 2.0:
+    if unit == "eur_mwh" or (unit == "auto" and med > 2.0):
+        series = series / 1000.0
+        print(f"  -> Prix convertis de EUR/MWh en EUR/kWh (mediane source {med:.1f}).")
+    elif med > 2.0:
         print(f"  /!\\ ATTENTION UNITES : la mediane des prix chargee est {med:.1f} -- "
               f"ca ressemble a des EUR/MWh, pas des EUR/kWh (colonne '{value_col}').")
 
