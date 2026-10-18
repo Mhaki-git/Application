@@ -258,6 +258,53 @@ def _parse_decimal_str(value) -> float:
         return float("nan")
 
 
+_MONTH_PREFIX = {"jan": 1, "fev": 2, "feb": 2, "mar": 3, "avr": 4, "apr": 4, "mai": 5, "may": 5,
+                 "aou": 8, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+# Annee attribuee a un releve mensuel qui ne donne que des noms de mois (pas d'annee) :
+# derniere annee civile ecoulee, non bissextile en pratique ; le moteur tourne sur 1 an.
+def _default_monthly_year() -> int:
+    return pd.Timestamp.now().year - 1
+
+
+def _month_from_token(value):
+    """Numero de mois (1-12) pour un nom de mois FR/EN (complet ou abrege, accents
+    et casse ignores : 'Janvier', 'févr.', 'Aug'...), ou pour un entier 1-12 ;
+    None si la valeur n'est pas un mois."""
+    import unicodedata
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if float(value).is_integer() and 1 <= value <= 12 else None
+    s = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode().lower().strip(" .\t")
+    if s.isdigit():
+        return int(s) if 1 <= int(s) <= 12 else None
+    if not s.isalpha() or len(s) < 3:
+        return None
+    if s.startswith("juil") or s == "jul" or s.startswith("july"):
+        return 7
+    if s.startswith("juin") or s.startswith("jun"):
+        return 6
+    return _MONTH_PREFIX.get(s[:3])
+
+
+def _parse_month_names(col: pd.Series):
+    """DatetimeIndex (1er du mois, annee par defaut) si TOUTES les valeurs de la
+    colonne sont des mois (noms ou 1-12), sinon None."""
+    months = [_month_from_token(v) for v in col]
+    if not months or any(m is None for m in months):
+        return None
+    year = _default_monthly_year()
+    return pd.DatetimeIndex([pd.Timestamp(year=year, month=m, day=1) for m in months])
+
+
+def _is_monthly_index(index) -> bool:
+    """Vrai si le pas median de l'index depasse ~27 jours (releve mensuel)."""
+    if len(index) < 2:
+        return False
+    return float(pd.Series(index).sort_values().diff().dropna().median() / pd.Timedelta(days=1)) >= 27
+
+
 def _read_csv_robuste(csv_path_or_buffer) -> pd.DataFrame:
     """Lit un CSV en detectant automatiquement le separateur de colonnes
     (',' ou ';' -- un export Excel FR utilise generalement ';' puisque ','
@@ -271,6 +318,11 @@ def _read_csv_robuste(csv_path_or_buffer) -> pd.DataFrame:
     sep = ";" if first_line.count(";") >= first_line.count(",") else ","
 
     import io
+    if _month_from_token(first_line.split(sep)[0].strip().strip('"')) is not None:
+        # Releve mensuel sans en-tete (1re ligne = 'Janvier;5000') : ne pas la prendre pour des titres.
+        df = pd.read_csv(io.StringIO(raw), sep=sep, header=None)
+        df.columns = ["timestamp"] + ["valeur" if i == 0 else f"valeur_{i + 1}" for i in range(df.shape[1] - 1)]
+        return df
     return pd.read_csv(io.StringIO(raw), sep=sep)
 
 
@@ -295,6 +347,7 @@ def _read_excel_table(raw_bytes: bytes) -> pd.DataFrame:
         raise ValueError("Fichier Excel vide.")
     first = df.iloc[0, 0]
     has_header = not (isinstance(first, (pd.Timestamp, __import__("datetime").datetime))
+                      or _month_from_token(first) is not None
                       or pd.notna(pd.to_datetime(str(first), dayfirst=True, errors="coerce")))
     if has_header:
         df.columns = [str(c).strip() for c in df.iloc[0]]
@@ -363,6 +416,9 @@ def _parse_timestamp_column(col: pd.Series) -> pd.DatetimeIndex:
     des premieres lignes (AAAA-JJ-MM) et planter des qu'une ligne suivante a
     un jour > 12 (ex: "2024-01-13" rejete car interprete comme "annee-jour-mois").
     """
+    months = _parse_month_names(col)
+    if months is not None:  # releve mensuel : 'Janvier'...'Decembre' (ou 1-12)
+        return months
     try:
         return pd.to_datetime(col, format="ISO8601")
     except (ValueError, TypeError):
@@ -431,16 +487,22 @@ def read_conso_injection_csv(csv_path_or_buffer, timestamp_col: str = None, valu
 
     if len(frame) < 2:
         raise ValueError("CSV de consommation : pas assez de lignes pour deduire le pas de temps.")
-    step_minutes = int(round((frame.index[1] - frame.index[0]).total_seconds() / 60))
-    if step_minutes <= 0:
-        raise ValueError("Impossible de deduire un pas de temps positif depuis le CSV de consommation.")
-
-    if unit.lower() == "kw":
-        factor = step_minutes / 60.0
-    elif unit.lower() == "kwh":
-        factor = 1.0
-    else:
+    if unit.lower() not in ("kw", "kwh"):
         raise ValueError(f"unit doit etre 'kW' ou 'kWh', recu : {unit!r}")
+
+    if _is_monthly_index(frame.index):
+        # Releve mensuel : une valeur par mois, pose au 1er du mois. kW = puissance
+        # moyenne du mois -> x heures du mois ; kWh = energie du mois telle quelle.
+        # Etalee ensuite uniformement sur les quarts d'heure par align_conso_to_quarter_hour.
+        frame.index = frame.index.to_period("M").to_timestamp()
+        frame = frame[~frame.index.duplicated(keep="first")]
+        factor = (frame.index.days_in_month.values * 24.0) if unit.lower() == "kw" else 1.0
+        step_minutes = 30 * 24 * 60
+    else:
+        step_minutes = int(round((frame.index[1] - frame.index[0]).total_seconds() / 60))
+        if step_minutes <= 0:
+            raise ValueError("Impossible de deduire un pas de temps positif depuis le CSV de consommation.")
+        factor = step_minutes / 60.0 if unit.lower() == "kw" else 1.0
 
     conso = pd.Series(frame["conso_raw"].values * factor, index=frame.index, name="conso_kwh")
     injection = None
@@ -587,6 +649,16 @@ def align_conso_to_quarter_hour(conso_kwh: pd.Series) -> pd.Series:
       de courbe -- simple etalement uniforme, a documenter dans le rapport).
     - Si le pas source est plus fin que 15 min : agrege par sommation.
     """
+    if _is_monthly_index(conso_kwh.index):
+        # Pas mensuel (longueur variable) : chaque mois est etale a parts egales sur
+        # ses quarts d'heure (jours reels du mois), l'energie mensuelle est conservee.
+        parts = []
+        for ts, val in conso_kwh.items():
+            qh = pd.date_range(ts, ts + pd.DateOffset(months=1), freq="15min", inclusive="left")
+            parts.append(pd.Series(val / len(qh), index=qh))
+        print("  /!\\ Releve mensuel : energie de chaque mois repartie uniformement sur ses quarts d'heure.")
+        return pd.concat(parts).rename("conso_kwh")
+
     step_minutes = int(round((conso_kwh.index[1] - conso_kwh.index[0]).total_seconds() / 60))
     if step_minutes == 15:
         return conso_kwh

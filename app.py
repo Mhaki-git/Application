@@ -366,7 +366,9 @@ with col1.container(border=True):
             "Relevé de consommation (CSV ou Excel)",
             type=["csv", "xlsx"],
             help="Horodatage + consommation, et en option une colonne d'injection. Pas de "
-                 "temps quelconque (15/30/60 min), détecté automatiquement.")
+                 "temps quelconque (15/30/60 min), détecté automatiquement. Un relevé mensuel "
+                 "(12 lignes, noms de mois ou dates) est accepté : chaque mois est réparti "
+                 "uniformément sur ses quarts d'heure (kWh = énergie du mois, kW = puissance moyenne).")
         conso_unit = st.radio("Unité des colonnes de valeurs", options=["kW", "kWh"], horizontal=True)
         if conso_file is not None:
             try:
@@ -1408,6 +1410,13 @@ def _render_results(results):
             PALETTE = dict(conso=NAVY, pv=SOLAR, import_=TEAL, soc="#8E7DBE", belpex="#C8553D")
             LARGEUR_TRAIT = 2.0
 
+            # Le solveur LP laisse des residus ~1e-12 a la place de vrais 0 : ils
+            # faisaient afficher des graduations/survols du type "3.5e-13". On ramene
+            # a 0 tout ce qui est negligeable (< 1e-6) avant de tracer.
+            _num = serie_plot.select_dtypes("number").columns
+            serie_plot = serie_plot.copy()
+            serie_plot[_num] = serie_plot[_num].where(serie_plot[_num].abs() >= 1e-6, 0.0)
+
             fig_qh = go.Figure()
             fig_qh.add_trace(go.Scattergl(
                 x=serie_plot.index, y=serie_plot["conso_kwh"] * 4, name="Consommation",
@@ -1447,10 +1456,14 @@ def _render_results(results):
                     rangeslider=dict(visible=True, thickness=0.06, bgcolor=PAL["chip"]),
                     uirevision=f"{vue}|{date_focus}|{resolution}",
                 ),
-                yaxis=dict(title="kW", side="left"),
-                yaxis2=dict(title="Batterie (%)", overlaying="y", side="right", range=[0, 100], showgrid=False),
+                yaxis=dict(title="kW", side="left", rangemode="tozero", hoverformat=",.1f",
+                           range=None if (serie_plot[["conso_kwh", "pv_kwh", "import_kwh"]].max().max() > 0) else [0, 1]),
+                yaxis2=dict(title="Batterie (%)", overlaying="y", side="right", range=[0, 100],
+                            showgrid=False, hoverformat=",.0f"),
                 yaxis3=dict(title="Belpex (€/kWh)", overlaying="y", side="right",
-                            position=0.97, showgrid=False, anchor="free"),
+                            position=0.97, showgrid=False, anchor="free", hoverformat=",.4f",
+                            range=None if ("belpex_eur_kwh" in serie_plot.columns
+                                           and serie_plot["belpex_eur_kwh"].abs().max() > 0) else [0, 1]),
                 legend=dict(uirevision="qh_legend_persistent"),
                 margin=dict(t=40, b=8),
             )
